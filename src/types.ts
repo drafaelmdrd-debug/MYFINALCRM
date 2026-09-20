@@ -8,6 +8,8 @@ export type MainNavView =
   | 'daily-tasks'
   | 'dnc'
   | 'language-barrier'
+  | 'needs-skiptracing'
+  | 'needs-deepdive'
   | 'campaigns'
   | 'search'
   | 'metrics'
@@ -23,7 +25,9 @@ export type StageId =
   | 'Manually Found'
   | 'Vacant Lots'
   | 'DNC'
-  | 'Language Barrier';
+  | 'Language Barrier'
+  | 'Needs Skiptracing/Deepdive'
+  | 'Needs Deepdive';
 
 export type SourceTabId =
   | 'Dallas'
@@ -51,6 +55,7 @@ export interface ContactPerson {
   id: string;
   name: string;
   role?: string;
+  relationship?: string;
   phoneNumbers?: PhoneNumberRecord[];
   notes?: string;
 }
@@ -71,7 +76,13 @@ export interface Lead {
   ownerName: string;
   propertyAddress: string;
   city?: string;
+  state?: string;
   zipCode?: string;
+  county?: string;
+  market?: string;
+  mailingAddress?: string;
+  mailingCity?: string;
+  mailingZip?: string;
   contacts?: ContactPerson[];
   phoneNumbers: PhoneNumberRecord[];
   stageId: StageId;
@@ -85,6 +96,7 @@ export interface Lead {
   outreachStatus: string;
   callNotes: string;
   vaNotes?: string;
+  notes?: string;
   askingPrice?: string;
   startingOffer?: string;
   maxOffer?: string;
@@ -94,6 +106,7 @@ export interface Lead {
   pushedDate?: string;
   dateAdded?: string;
   dateAddedToDNC?: string;
+  dateAddedToDeepdive?: string;
   markedBy?: string;
   languageType?: string;
   campaign: string;

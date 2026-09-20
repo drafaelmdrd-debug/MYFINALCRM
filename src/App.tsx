@@ -8,6 +8,7 @@ import {
   CallResultCount,
   FollowUpTaskKPIs,
   TimesheetPunch,
+  StageId,
 } from './types';
 import {
   INITIAL_LEADS,
@@ -33,11 +34,14 @@ import { SearchView } from './components/SearchView';
 import { TimesheetView } from './components/TimesheetView';
 import { DNCView } from './components/DNCView';
 import { LanguageBarrierView } from './components/LanguageBarrierView';
+import { NeedsDeepdiveView } from './components/NeedsDeepdiveView';
 import { triggerImmediateDial } from './dialerProtocol';
-import { isLeadInDealPipeline } from './logic/moveEngine';
+import { isLeadInDealPipeline, isDNCStatus, isLanguageStatus } from './logic/moveEngine';
 import { LeadDetailDrawer } from './components/LeadDetailDrawer';
-import { BulkImportModal } from './components/BulkImportModal';
+import { BulkImportModal, ImportDestination } from './components/BulkImportModal';
 import { NewLeadModal } from './components/NewLeadModal';
+import { ExportModal } from './components/ExportModal';
+import { defaultGroupsForView } from './logic/exportLeads';
 import { subscribeDialerSync } from './utils/dialerSyncChannel';
 import { CheckCircle2 } from 'lucide-react';
 import { useAuth } from './lib/AuthContext';
@@ -120,7 +124,9 @@ export default function App() {
   const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
   const [activeDialerLeadId, setActiveDialerLeadId] = useState<string | undefined>(undefined);
   const [isBulkImportOpen, setIsBulkImportOpen] = useState<boolean>(false);
+  const [bulkImportDestination, setBulkImportDestination] = useState<ImportDestination>('existing_campaign');
   const [isNewLeadModalOpen, setIsNewLeadModalOpen] = useState<boolean>(false);
+  const [isExportOpen, setIsExportOpen] = useState<boolean>(false);
   const [toast, setToast] = useState<{ message: string; sub?: string } | null>(null);
 
   // Once leads have loaded from the shared workspace, recompile today's task
@@ -349,6 +355,54 @@ export default function App() {
     showToast(`Saved changes for ${updatedLead.ownerName}`);
   };
 
+  // Delete entire lead permanently
+  const handleDeleteLead = (leadId: string) => {
+    const targetLead = leads.find((l) => l.id === leadId);
+    const leadName = targetLead ? targetLead.ownerName : 'Lead';
+
+    setLeads((prev) => prev.filter((l) => l.id !== leadId));
+    setTasks((prev) => prev.filter((t) => t.leadId !== leadId));
+
+    // If currently open in drawer, close it
+    if (selectedLead?.id === leadId) {
+      setSelectedLead(null);
+      setIsDrawerOpen(false);
+    }
+
+    // If currently active in power dialer, shift to next lead
+    if (activeDialerLeadId === leadId) {
+      const remainingDialerLeads = leads
+        .filter((l) => l.id !== leadId)
+        .filter((l) => !isLeadInDealPipeline(l));
+      setActiveDialerLeadId(remainingDialerLeads[0]?.id);
+    }
+
+    showToast(`Deleted entire lead: ${leadName}`, 'Lead Removed');
+  };
+
+  // Delete individual phone number record from a lead
+  const handleDeletePhoneNumber = (leadId: string, phoneId: string) => {
+    const targetLead = leads.find((l) => l.id === leadId);
+    if (!targetLead) return;
+
+    const phoneRec = targetLead.phoneNumbers.find((p) => p.id === phoneId);
+    const numStr = phoneRec ? phoneRec.number : 'number';
+    const updatedPhones = targetLead.phoneNumbers.filter((p) => p.id !== phoneId);
+
+    const updatedLead: Lead = {
+      ...targetLead,
+      phoneNumbers: updatedPhones,
+    };
+
+    setLeads((prev) => prev.map((l) => (l.id === leadId ? updatedLead : l)));
+
+    if (selectedLead?.id === leadId) {
+      setSelectedLead(updatedLead);
+    }
+
+    showToast(`Deleted number ${numStr} from ${targetLead.ownerName}`, 'Number Removed');
+  };
+
   // Save after call in Power Dialer (Matches saveAfterCall & recordCallResult_)
   const handleSaveAfterCall = (
     leadId: string,
@@ -356,66 +410,169 @@ export default function App() {
     disposition: Disposition,
     notes: string,
     askingPrice: string,
-    agent: VA
+    agent: VA,
+    fromPowerDialer: boolean = true
   ) => {
     const lead = leads.find((l) => l.id === leadId);
     if (!lead) return;
 
-    // 1. Update phone record with disposition tag
-    const updatedPhones = lead.phoneNumbers.map((p) => {
-      if (p.number === phoneNumber) {
-        return {
-          ...p,
-          lastDispo: disposition,
-        };
+    // Special Exception for Power Dialer:
+    // "keep everything on disposition the same, howveer make an exeption for the leads from power dialer, DNC and language barrier disposition will only dispo that certain number with the copied lead info ofcourseand move it to there designated location, other numbers will stay on the power dialer, again only applicable for leads under PowerDialer and only for disposition DNC and Language Barrier"
+    const isGranularSpecialDispo =
+      fromPowerDialer && (isDNCStatus(disposition) || isLanguageStatus(disposition));
+
+    let newLeads: Lead[];
+    let movedStage: StageId | undefined;
+    let assignedOwner: VA = agent;
+
+    if (isGranularSpecialDispo && lead.phoneNumbers.length > 1) {
+      // Find the specific phone record being dispositioned
+      const dispoPhoneRecord =
+        lead.phoneNumbers.find((p) => p.number === phoneNumber) || lead.phoneNumbers[0];
+      const remainingPhoneRecords = lead.phoneNumbers.filter(
+        (p) => p !== dispoPhoneRecord && p.number !== dispoPhoneRecord.number
+      );
+
+      const isDNC = isDNCStatus(disposition);
+      const targetStage: StageId = isDNC ? 'DNC' : 'Language Barrier';
+      const targetContactName = dispoPhoneRecord.contactName || lead.ownerName;
+
+      // 1. Create the copied lead record for designated location (DNC or Language Barrier)
+      const copiedLead: Lead = {
+        ...lead,
+        id: `lead-dispo-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        leadId: `${lead.leadId}-${isDNC ? 'DNC' : 'LANG'}`,
+        ownerName: targetContactName,
+        phoneNumbers: [
+          {
+            ...dispoPhoneRecord,
+            lastDispo: disposition,
+          },
+        ],
+        stageId: targetStage,
+        promotedToPipeline: true,
+        callsCount: 1,
+        lastCallDate: formatDateToYYYYMMDD(new Date()),
+        lastDispo: disposition,
+        askingPrice: askingPrice || lead.askingPrice,
+        assignedVA: ['Jah', 'Jen', 'Rain'].includes(agent) ? (agent as VA) : lead.assignedVA,
+        dateAddedToDNC: isDNC ? new Date().toISOString() : undefined,
+        dateAdded: !isDNC ? new Date().toISOString() : undefined,
+        markedBy: agent,
+        languageType: !isDNC ? disposition : undefined,
+        vaStatus: disposition,
+        outreachStatus: `1 call logged\nLast: ${disposition}`,
+        callNotes: appendTimestampedNote(
+          lead.callNotes || lead.vaNotes || '',
+          `[${disposition} - ${dispoPhoneRecord.number} (${targetContactName})]: ${
+            notes.trim() || 'Dispositioned from Power Dialer'
+          }`
+        ),
+        vaNotes: appendTimestampedNote(
+          lead.callNotes || lead.vaNotes || '',
+          `[${disposition} - ${dispoPhoneRecord.number} (${targetContactName})]: ${
+            notes.trim() || 'Dispositioned from Power Dialer'
+          }`
+        ),
+      };
+
+      movedStage = targetStage;
+      assignedOwner = copiedLead.assignedVA;
+
+      // 2. Original lead stays on Power Dialer with remaining numbers
+      let updatedOriginalNotes = lead.callNotes || lead.vaNotes || '';
+      if (notes.trim()) {
+        updatedOriginalNotes = appendTimestampedNote(
+          updatedOriginalNotes,
+          `[${dispoPhoneRecord.number} (${targetContactName}) marked ${disposition}]: ${notes.trim()}`
+        );
+      } else {
+        updatedOriginalNotes = appendTimestampedNote(
+          updatedOriginalNotes,
+          `[${dispoPhoneRecord.number} (${targetContactName}) moved to ${targetStage}]`
+        );
       }
-      return p;
-    });
 
-    // 2. Append timestamped notes if typed
-    let updatedNotes = lead.callNotes || lead.vaNotes || '';
-    if (notes.trim()) {
-      updatedNotes = appendTimestampedNote(updatedNotes, notes);
-    }
+      const updatedOriginalLead: Lead = {
+        ...lead,
+        phoneNumbers: remainingPhoneRecords,
+        callNotes: updatedOriginalNotes,
+        vaNotes: updatedOriginalNotes,
+        askingPrice: askingPrice || lead.askingPrice,
+        callsCount: lead.callsCount + 1,
+        lastCallDate: formatDateToYYYYMMDD(new Date()),
+        lastDispo: disposition,
+      };
 
-    // 3. Base updated lead record
-    // Ownership Rule: "Make sure whoever dispo it will be the owner once moved on project management, if Jah, Jen or Rain."
-    const isDispoVA = agent === 'Jah' || agent === 'Jen' || agent === 'Rain';
-    const dispoOwner: VA = isDispoVA
-      ? agent
-      : (['Jah', 'Jen', 'Rain'].includes(lead.assignedVA) ? lead.assignedVA : 'Rain');
+      newLeads = [copiedLead, ...leads.map((l) => (l.id === lead.id ? updatedOriginalLead : l))];
+      setLeads(newLeads);
 
-    let updatedLead: Lead = {
-      ...lead,
-      phoneNumbers: updatedPhones,
-      callNotes: updatedNotes,
-      vaNotes: updatedNotes,
-      askingPrice: askingPrice || lead.askingPrice,
-      callsCount: lead.callsCount + 1,
-      lastCallDate: formatDateToYYYYMMDD(new Date()),
-      lastDispo: disposition,
-      outreachStatus: `${lead.callsCount + 1} call${lead.callsCount + 1 > 1 ? 's' : ''} logged\nLast: ${disposition}`,
-      assignedVA: dispoOwner,
-    };
+      if (selectedLead?.id === lead.id) {
+        setSelectedLead(updatedOriginalLead);
+      }
 
-    // 4. Trigger CRM Move Engine if disposition is a routing trigger
-    let targetStatus = disposition as string;
-    if (disposition === 'CALLBACK') targetStatus = 'Callback';
-    if (disposition === 'LISTED ON MLS') targetStatus = 'Listed';
+      showToast(
+        `Number ${dispoPhoneRecord.number} moved to ${targetStage}. Remaining ${remainingPhoneRecords.length} number(s) stay active on Power Dialer.`,
+        'Granular Disposition'
+      );
+    } else {
+      // Standard disposition flow (keep everything on disposition the same)
+      const updatedPhones = lead.phoneNumbers.map((p) => {
+        if (p.number === phoneNumber) {
+          return {
+            ...p,
+            lastDispo: disposition,
+          };
+        }
+        return p;
+      });
 
-    const routeRes = routeLead(updatedLead, targetStatus, agent);
-    updatedLead = routeRes.updatedLead;
+      let updatedNotes = lead.callNotes || lead.vaNotes || '';
+      if (notes.trim()) {
+        updatedNotes = appendTimestampedNote(updatedNotes, notes);
+      }
 
-    // 5. Update leads list
-    const newLeads = leads.map((l) => (l.id === updatedLead.id ? updatedLead : l));
-    setLeads(newLeads);
+      const isDispoVA = agent === 'Jah' || agent === 'Jen' || agent === 'Rain';
+      const dispoOwner: VA = isDispoVA
+        ? agent
+        : (['Jah', 'Jen', 'Rain'].includes(lead.assignedVA) ? lead.assignedVA : 'Rain');
 
-    // If moved to Deal Pipeline, DNC, or Language Barrier, advance active dialer lead
-    const remainingDialerLeads = newLeads.filter((l) => !isLeadInDealPipeline(l));
-    if (activeDialerLeadId === leadId) {
-      const nextLead = remainingDialerLeads.find((l) => l.id !== leadId) || remainingDialerLeads[0];
-      if (nextLead) {
-        setActiveDialerLeadId(nextLead.id);
+      let updatedLead: Lead = {
+        ...lead,
+        phoneNumbers: updatedPhones,
+        callNotes: updatedNotes,
+        vaNotes: updatedNotes,
+        askingPrice: askingPrice || lead.askingPrice,
+        callsCount: lead.callsCount + 1,
+        lastCallDate: formatDateToYYYYMMDD(new Date()),
+        lastDispo: disposition,
+        outreachStatus: `${lead.callsCount + 1} call${lead.callsCount + 1 > 1 ? 's' : ''} logged\nLast: ${disposition}`,
+        assignedVA: dispoOwner,
+      };
+
+      let targetStatus = disposition as string;
+      if (disposition === 'CALLBACK') targetStatus = 'Callback';
+      if (disposition === 'LISTED ON MLS') targetStatus = 'Listed';
+
+      const routeRes = routeLead(updatedLead, targetStatus, agent);
+      updatedLead = routeRes.updatedLead;
+      movedStage = routeRes.movedToStage;
+      assignedOwner = updatedLead.assignedVA;
+
+      newLeads = leads.map((l) => (l.id === updatedLead.id ? updatedLead : l));
+      setLeads(newLeads);
+
+      if (selectedLead?.id === lead.id) {
+        setSelectedLead(updatedLead);
+      }
+
+      // If moved to Deal Pipeline, DNC, or Language Barrier, advance active dialer lead
+      const remainingDialerLeads = newLeads.filter((l) => !isLeadInDealPipeline(l));
+      if (activeDialerLeadId === leadId) {
+        const nextLead = remainingDialerLeads.find((l) => l.id !== leadId) || remainingDialerLeads[0];
+        if (nextLead) {
+          setActiveDialerLeadId(nextLead.id);
+        }
       }
     }
 
@@ -446,7 +603,7 @@ export default function App() {
 
     showToast(
       `Saved ${agent} | ${phoneNumber} | ${disposition}`,
-      routeRes.movedToStage ? `Auto-routed to ${routeRes.movedToStage} (Owner: ${updatedLead.assignedVA})` : undefined
+      movedStage ? `Auto-routed to ${movedStage} (Owner: ${assignedOwner})` : undefined
     );
   };
 
@@ -635,6 +792,9 @@ export default function App() {
   const pipelineCount = leads.filter((l) => l.stageId === 'Project Mgmt').length;
   const dncCount = leads.filter((l) => l.stageId === 'DNC').length;
   const languageBarrierCount = leads.filter((l) => l.stageId === 'Language Barrier').length;
+  const needsDeepdiveCount = leads.filter(
+    (l) => l.stageId === 'Needs Skiptracing/Deepdive' || l.stageId === 'Needs Deepdive'
+  ).length;
   const tasksDueCount = tasks.filter((t) => !t.completed).length;
 
   // Auth gate: don't show the workspace until we know who (if anyone) is signed in.
@@ -686,6 +846,7 @@ export default function App() {
         }}
         onOpenNewLead={() => setIsNewLeadModalOpen(true)}
         onOpenImport={() => setIsBulkImportOpen(true)}
+        onOpenExport={() => setIsExportOpen(true)}
         userEmail={session?.user?.email}
         onSignOut={signOut}
       />
@@ -701,6 +862,7 @@ export default function App() {
           dailyTasksCount={tasksDueCount}
           dncCount={dncCount}
           languageBarrierCount={languageBarrierCount}
+          needsDeepdiveCount={needsDeepdiveCount}
         />
 
         {/* View Routing Container */}
@@ -713,6 +875,9 @@ export default function App() {
               onLeadChange={setActiveDialerLeadId}
               onOpenBulkImport={() => setIsBulkImportOpen(true)}
               onAddNewLead={() => setIsNewLeadModalOpen(true)}
+              onUpdateLead={handleUpdateLead}
+              onDeleteLead={handleDeleteLead}
+              onDeletePhoneNumber={handleDeletePhoneNumber}
             />
           )}
 
@@ -760,6 +925,8 @@ export default function App() {
               onOpenLeadDetail={handleOpenLeadDetail}
               onUpdateStatus={handleStatusChange}
               onLaunchDialer={handleLaunchDialer}
+              onOpenImport={() => setIsBulkImportOpen(true)}
+              onDeleteLead={handleDeleteLead}
             />
           )}
 
@@ -771,6 +938,8 @@ export default function App() {
               onOpenBulkImport={() => setIsBulkImportOpen(true)}
               onOpenLeadDetail={handleOpenLeadDetail}
               onLaunchDialer={handleLaunchDialer}
+              onDeleteLead={handleDeleteLead}
+              onDeletePhoneNumber={handleDeletePhoneNumber}
             />
           )}
 
@@ -780,6 +949,8 @@ export default function App() {
               onOpenLeadDetail={handleOpenLeadDetail}
               onMoveLead={(lead, targetStage) => handleStatusChange(lead, targetStage)}
               onLaunchDialer={handleLaunchDialer}
+              onDeleteLead={handleDeleteLead}
+              onDeletePhoneNumber={handleDeletePhoneNumber}
             />
           )}
 
@@ -790,6 +961,26 @@ export default function App() {
               onMoveLead={(lead, targetStage) => handleStatusChange(lead, targetStage)}
               onAssignVA={(lead, newVA) => handleUpdateLead({ ...lead, assignedVA: newVA })}
               onLaunchDialer={handleLaunchDialer}
+              onDeleteLead={handleDeleteLead}
+              onDeletePhoneNumber={handleDeletePhoneNumber}
+            />
+          )}
+
+          {(currentView === 'needs-skiptracing' || currentView === 'needs-deepdive') && (
+            <NeedsDeepdiveView
+              leads={leads}
+              onOpenLeadDetail={handleOpenLeadDetail}
+              onMoveLead={(lead, targetStage) => handleStatusChange(lead, targetStage)}
+              onUpdateLead={handleUpdateLead}
+              onAddNewLead={handleAddNewLead}
+              onOpenBulkImport={() => {
+                setBulkImportDestination('needs_skiptracing');
+                setIsBulkImportOpen(true);
+              }}
+              onImportLeads={handleBulkImportLeads}
+              onLaunchDialer={handleLaunchDialer}
+              onDeleteLead={handleDeleteLead}
+              onDeletePhoneNumber={handleDeletePhoneNumber}
             />
           )}
 
@@ -798,6 +989,8 @@ export default function App() {
               leads={leads}
               onOpenLeadDetail={handleOpenLeadDetail}
               onLaunchDialer={handleLaunchDialer}
+              onDeleteLead={handleDeleteLead}
+              onDeletePhoneNumber={handleDeletePhoneNumber}
             />
           )}
         </main>
@@ -811,6 +1004,8 @@ export default function App() {
         onUpdateLead={handleUpdateLead}
         onLaunchDialer={handleLaunchDialer}
         onStatusChange={handleStatusChange}
+        onDeleteLead={handleDeleteLead}
+        onDeletePhoneNumber={handleDeletePhoneNumber}
       />
 
       {/* Bulk Lead Import Modal */}
@@ -820,6 +1015,19 @@ export default function App() {
         campaigns={campaigns}
         onAddNewCampaign={handleAddNewCampaign}
         onImportLeads={handleBulkImportLeads}
+        defaultDestination={bulkImportDestination}
+      />
+
+      {/* Export Leads Modal */}
+      <ExportModal
+        isOpen={isExportOpen}
+        onClose={() => setIsExportOpen(false)}
+        leads={leads}
+        campaigns={campaigns}
+        defaultSelected={defaultGroupsForView(currentView)}
+        onExported={(count, fileName) =>
+          showToast(`Exported ${count} lead${count === 1 ? '' : 's'} to ${fileName}`, 'Export Complete')
+        }
       />
 
       {/* New Lead Modal */}
