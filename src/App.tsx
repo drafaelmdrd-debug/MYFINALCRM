@@ -40,44 +40,36 @@ import { BulkImportModal } from './components/BulkImportModal';
 import { NewLeadModal } from './components/NewLeadModal';
 import { subscribeDialerSync } from './utils/dialerSyncChannel';
 import { CheckCircle2 } from 'lucide-react';
+import { useAuth } from './lib/AuthContext';
+import { LoginScreen } from './components/LoginScreen';
+import { useCloudState } from './lib/cloudSync';
+
+const DEFAULT_CAMPAIGNS = [
+  'Dallas Tax Delinquent',
+  'Tarrant County',
+  'DFW Infill Vacant Lots',
+  'Legacy Dallas',
+  'Large Acres',
+  'TAX Delinquent 2026',
+  '75210 South Dallas',
+  '75215 South Dallas',
+  'ResempliAddressesPulled',
+  'Manually Found',
+];
 
 export default function App() {
-  // Master Leads State
-  const [leads, setLeads] = useState<Lead[]>(() => {
-    const saved = localStorage.getItem('groundwork_crm_leads');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error('Failed to parse saved leads', e);
-      }
-    }
-    return INITIAL_LEADS;
-  });
+  const { session, loading: authLoading, signOut } = useAuth();
+  const signedIn = !!session;
 
-  // Campaigns State
-  const [campaigns, setCampaigns] = useState<string[]>(() => {
-    const saved = localStorage.getItem('groundwork_crm_campaigns');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error('Failed to parse saved campaigns', e);
-      }
-    }
-    return [
-      'Dallas Tax Delinquent',
-      'Tarrant County',
-      'DFW Infill Vacant Lots',
-      'Legacy Dallas',
-      'Large Acres',
-      'TAX Delinquent 2026',
-      '75210 South Dallas',
-      '75215 South Dallas',
-      'ResempliAddressesPulled',
-      'Manually Found',
-    ];
-  });
+  // Master Leads State — shared across every signed-in user via Supabase
+  const [leads, setLeads, leadsLoaded] = useCloudState<Lead[]>('leads', INITIAL_LEADS, signedIn);
+
+  // Campaigns State — shared
+  const [campaigns, setCampaigns] = useCloudState<string[]>(
+    'campaigns',
+    DEFAULT_CAMPAIGNS,
+    signedIn
+  );
 
   // Helper to preserve task completion status across re-evaluations
   const mergeDailyTasks = (freshTasks: CRMTask[], prevTasks: CRMTask[]): CRMTask[] => {
@@ -100,44 +92,26 @@ export default function App() {
     return generateDailyTasks(INITIAL_LEADS);
   });
 
-  // KPI Call Results Counts State
-  const [callResults, setCallResults] = useState<CallResultCount>(() => {
-    const saved = localStorage.getItem('groundwork_crm_call_results');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error('Failed to parse saved call results', e);
-      }
-    }
-    return INITIAL_CALL_RESULTS;
-  });
+  // KPI Call Results Counts State — shared
+  const [callResults, setCallResults] = useCloudState<CallResultCount>(
+    'call_results',
+    INITIAL_CALL_RESULTS,
+    signedIn
+  );
 
-  // Follow-Up Task Call Counts State
-  const [followupTaskCalls, setFollowupTaskCalls] = useState<FollowUpTaskKPIs>(() => {
-    const saved = localStorage.getItem('groundwork_crm_followup_kpis');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error('Failed to parse saved follow-up KPIs', e);
-      }
-    }
-    return INITIAL_FOLLOWUP_TASK_CALLS;
-  });
+  // Follow-Up Task Call Counts State — shared
+  const [followupTaskCalls, setFollowupTaskCalls] = useCloudState<FollowUpTaskKPIs>(
+    'followup_kpis',
+    INITIAL_FOLLOWUP_TASK_CALLS,
+    signedIn
+  );
 
-  // Operational Timesheet Punches State
-  const [punches, setPunches] = useState<TimesheetPunch[]>(() => {
-    const saved = localStorage.getItem('groundwork_crm_timesheet_punches');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (e) {
-        console.error('Failed to parse saved timesheet punches', e);
-      }
-    }
-    return INITIAL_PUNCHES;
-  });
+  // Operational Timesheet Punches State — shared
+  const [punches, setPunches] = useCloudState<TimesheetPunch[]>(
+    'timesheet_punches',
+    INITIAL_PUNCHES,
+    signedIn
+  );
 
   // UI Navigation & Modals State
   const [currentView, setCurrentView] = useState<MainNavView>('power-dialer');
@@ -149,34 +123,22 @@ export default function App() {
   const [isNewLeadModalOpen, setIsNewLeadModalOpen] = useState<boolean>(false);
   const [toast, setToast] = useState<{ message: string; sub?: string } | null>(null);
 
-  // Sync leads to localStorage
+  // Once leads have loaded from the shared workspace, recompile today's task
+  // board from them (the initial `tasks` state above was built from the
+  // local placeholder data before the real leads arrived).
   useEffect(() => {
-    localStorage.setItem('groundwork_crm_leads', JSON.stringify(leads));
-  }, [leads]);
-
-  // Sync campaigns to localStorage
-  useEffect(() => {
-    localStorage.setItem('groundwork_crm_campaigns', JSON.stringify(campaigns));
-  }, [campaigns]);
-
-  // Sync call results to localStorage
-  useEffect(() => {
-    localStorage.setItem('groundwork_crm_call_results', JSON.stringify(callResults));
-  }, [callResults]);
-
-  // Sync follow-up task calls to localStorage
-  useEffect(() => {
-    localStorage.setItem('groundwork_crm_followup_kpis', JSON.stringify(followupTaskCalls));
-  }, [followupTaskCalls]);
-
-  // Sync timesheet punches to localStorage
-  useEffect(() => {
-    localStorage.setItem('groundwork_crm_timesheet_punches', JSON.stringify(punches));
-  }, [punches]);
+    if (leadsLoaded) {
+      setTasks((prev) => mergeDailyTasks(generateDailyTasks(leads), prev));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [leadsLoaded]);
 
   // Daily Call Dispositions Matrix Refresh:
   // "Call Dispositions Matrix refreshes everyday"
+  // This still uses localStorage for the *date marker* only — it's a
+  // per-browser "have I already refreshed today" flag, not shared data.
   useEffect(() => {
+    if (!signedIn) return;
     const today = new Date().toISOString().split('T')[0];
     const lastDate = localStorage.getItem('groundwork_crm_call_results_date');
     if (lastDate && lastDate !== today) {
@@ -185,11 +147,11 @@ export default function App() {
         refreshed[k] = { Rain: 0, Jah: 0, Jen: 0, David: 0, total: 0 };
       });
       setCallResults(refreshed);
-      localStorage.setItem('groundwork_crm_call_results', JSON.stringify(refreshed));
       showToast('Call Results Dispositions matrix refreshed for today’s session.', 'Daily Refresh');
     }
     localStorage.setItem('groundwork_crm_call_results_date', today);
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signedIn]);
 
   const showToast = (message: string, sub?: string) => {
     setToast({ message, sub });
@@ -265,7 +227,6 @@ export default function App() {
     });
 
     setFollowupTaskCalls(counts);
-    localStorage.setItem('groundwork_crm_followup_kpis', JSON.stringify(counts));
     return counts;
   };
 
@@ -282,7 +243,6 @@ export default function App() {
   const handleDailyRefreshFollowUpTasks = () => {
     const zeroCounts: FollowUpTaskKPIs = { Jen: 0, Jah: 0, Rain: 0, David: 0 };
     setFollowupTaskCalls(zeroCounts);
-    localStorage.setItem('groundwork_crm_followup_kpis', JSON.stringify(zeroCounts));
 
     // Reset daily tasks to uncompleted so the team starts fresh from 0
     setTasks((prev) => prev.map((t) => ({ ...t, completed: false, completedAt: undefined })));
@@ -542,9 +502,7 @@ export default function App() {
       setFollowupTaskCalls((prev) => {
         const currentVal = prev[attributedVA] || 0;
         const nextVal = isNowDone ? currentVal + 1 : Math.max(0, currentVal - 1);
-        const updated = { ...prev, [attributedVA]: nextVal };
-        localStorage.setItem('groundwork_crm_followup_kpis', JSON.stringify(updated));
-        return updated;
+        return { ...prev, [attributedVA]: nextVal };
       });
     }
 
@@ -576,9 +534,7 @@ export default function App() {
     setFollowupTaskCalls((prev) => {
       const currentVal = prev[attributedVA] || 0;
       const nextVal = newCompleted ? currentVal + 1 : Math.max(0, currentVal - 1);
-      const updated = { ...prev, [attributedVA]: nextVal };
-      localStorage.setItem('groundwork_crm_followup_kpis', JSON.stringify(updated));
-      return updated;
+      return { ...prev, [attributedVA]: nextVal };
     });
 
     showToast(
@@ -681,6 +637,29 @@ export default function App() {
   const languageBarrierCount = leads.filter((l) => l.stageId === 'Language Barrier').length;
   const tasksDueCount = tasks.filter((t) => !t.completed).length;
 
+  // Auth gate: don't show the workspace until we know who (if anyone) is signed in.
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#F8F6F1] text-sm text-[#5E6660]">
+        Loading…
+      </div>
+    );
+  }
+
+  if (!signedIn) {
+    return <LoginScreen />;
+  }
+
+  // Data gate: wait for the shared workspace data to load before rendering,
+  // so nobody briefly sees the empty/placeholder state on first load.
+  if (!leadsLoaded) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#F8F6F1] text-sm text-[#5E6660]">
+        Loading shared workspace…
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen flex flex-col bg-[#F8F6F1] text-[#1F2421] selection:bg-[#B85338]/20 selection:text-[#B85338]">
       {/* Toast Notification Banner */}
@@ -707,6 +686,8 @@ export default function App() {
         }}
         onOpenNewLead={() => setIsNewLeadModalOpen(true)}
         onOpenImport={() => setIsBulkImportOpen(true)}
+        userEmail={session?.user?.email}
+        onSignOut={signOut}
       />
 
       {/* Main Layout Area */}
