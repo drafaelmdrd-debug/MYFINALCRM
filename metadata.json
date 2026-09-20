@@ -1,0 +1,6 @@
+{
+  "name": "GroundWork CRM",
+  "description": "Real estate lead pipeline CRM and Power Dialer with automated lead routing, tasks, and KPI metrics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
