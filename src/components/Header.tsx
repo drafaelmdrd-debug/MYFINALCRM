@@ -1,11 +1,13 @@
 import React from 'react';
-import { Search, Plus, Upload, Building2, PhoneCall } from 'lucide-react';
+import { Search, Plus, Upload, Building2, PhoneCall, LogOut } from 'lucide-react';
 
 interface HeaderProps {
   searchQuery: string;
   onSearchChange: (query: string) => void;
   onOpenNewLead: () => void;
   onOpenImport: () => void;
+  userEmail?: string | null;
+  onSignOut?: () => void;
 }
 
 export function Header({
@@ -13,6 +15,8 @@ export function Header({
   onSearchChange,
   onOpenNewLead,
   onOpenImport,
+  userEmail,
+  onSignOut,
 }: HeaderProps) {
   return (
     <header className="h-16 bg-[#FFFFFF] border-b border-[#E4E0D6] px-6 flex items-center justify-between gap-4 sticky top-0 z-30">
@@ -79,6 +83,25 @@ export function Header({
           <Plus className="w-3.5 h-3.5" />
           <span>New Lead</span>
         </button>
+
+        {onSignOut && (
+          <div className="flex items-center gap-2 pl-2.5 ml-1 border-l border-[#E4E0D6]">
+            {userEmail && (
+              <span className="text-[11px] text-[#5E6660] max-w-[140px] truncate hidden lg:inline">
+                {userEmail}
+              </span>
+            )}
+            <button
+              id="btn-sign-out"
+              type="button"
+              onClick={onSignOut}
+              title="Sign out"
+              className="flex items-center gap-1.5 px-2.5 py-2 text-xs font-bold text-[#5E6660] hover:text-[#1F2421] bg-white hover:bg-[#F2EFE8] border border-[#E4E0D6] rounded-lg shadow-2xs transition-colors cursor-pointer"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
       </div>
     </header>
   );
