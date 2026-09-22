@@ -367,29 +367,31 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
     );
   };
 
-  // Skip Number is scoped the same way as NEXT # — same-owner only. `hasNextNumber` /
-  // `nextPhoneToDial` (declared below) already stop at the current owner's last number.
-  const handleSkipNumber = () => {
+  // Next Number: switches the number on display to the next number without dialing automatically
+  const handleNextNumber = () => {
     if (!currentLead || !hasNextNumber || !nextPhoneToDial) {
-      showToast('No more numbers to skip to for this owner.');
+      showToast('No more numbers for this owner. Use NEXT OWNER to move on.');
       return;
     }
-    const skippedIdx = currentPhoneIndex + 1;
+    const nextIdx = currentPhoneIndex + 1;
     const targetPhone = nextPhoneToDial;
-    setCurrentPhoneIndex(skippedIdx);
-    setNextDialIdx(skippedIdx + 1);
+    setCurrentPhoneIndex(nextIdx);
+    setNextDialIdx(nextIdx + 1);
     setIsTimerActive(false);
     setCallSeconds(0);
     resetCallState();
     broadcastDialerSync({
-      phoneIndex: skippedIdx,
-      nextDialIdx: skippedIdx + 1,
+      phoneIndex: nextIdx,
+      nextDialIdx: nextIdx + 1,
       phoneNumber: targetPhone.number,
       leadId: currentLead.id,
     });
     const targetOwner = targetPhone.contactName || currentLead.ownerName;
-    showToast(`Skipped to ${targetOwner} • ${targetPhone.label} (${targetPhone.number})`);
+    showToast(`Switched display to Next # (${nextIdx + 1} of ${currentLead.phoneNumbers.length}): ${targetOwner} • ${targetPhone.label} (${targetPhone.number})`);
   };
+
+  // Skip Number: alias to advance display to next number without dialing
+  const handleSkipNumber = handleNextNumber;
 
   // Next Owner: jumps straight to the next distinct owner's first phone number.
   const handleNextOwner = () => {
@@ -986,42 +988,19 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
                   </div>
 
                   <div>
-                    <DialLink
+                    <button
+                      type="button"
                       id="btn-next-number"
-                      number={nextPhoneToDial?.number}
-                      leadId={currentLead.id}
-                      onDial={({ number }) => {
-                        const newTargetIdx = currentPhoneIndex + 1;
-                        const newNextIdx = newTargetIdx + 1;
-                        setCurrentPhoneIndex(newTargetIdx);
-                        setNextDialIdx(newNextIdx);
-                        setIsTimerActive(true);
-                        setCallSeconds(0);
-                        broadcastDialerSync({
-                          action: 'dial',
-                          phoneIndex: newTargetIdx,
-                          nextDialIdx: newNextIdx,
-                          phoneNumber: number,
-                          leadId: currentLead.id,
-                          isCalling: true,
-                          callSeconds: 0,
-                        });
-                        const nextContactName = nextPhoneToDial?.contactName || currentLead.ownerName;
-                        showToast(
-                          `Dialing Next # (${newTargetIdx + 1} of ${currentLead.phoneNumbers.length} • ${nextContactName}): ${number}...`
-                        );
-                      }}
-                      onNoNumber={() => {
-                        showToast('No more numbers for this owner. Use NEXT OWNER to move on.');
-                      }}
-                      className={`py-2.5 px-3 rounded-md border text-xs font-extrabold flex items-center justify-center gap-1.5 transition-colors no-underline w-full ${
+                      onClick={handleNextNumber}
+                      disabled={!hasNextNumber}
+                      className={`py-2.5 px-3 rounded-md border text-xs font-extrabold flex items-center justify-center gap-1.5 transition-colors w-full ${
                         hasNextNumber
                           ? 'bg-[#1F2421] text-white border-[#1F2421] hover:bg-[#363E38] cursor-pointer shadow-sm'
                           : 'bg-[#FFFFFF] text-[#5E6660] border-[#E4E0D6] opacity-60 cursor-not-allowed'
                       }`}
                       title={
                         nextPhoneToDial
-                          ? `Dial next number: ${nextPhoneToDial.number}`
+                          ? `Switch display to next number: ${nextPhoneToDial.number} (${nextPhoneToDial.contactName || nextPhoneToDial.label})`
                           : 'No more numbers for this owner'
                       }
                     >
@@ -1032,7 +1011,7 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
                           ({Math.min(currentPhoneIndex + 2, currentLead.phoneNumbers.length)}/{currentLead.phoneNumbers.length})
                         </span>
                       )}
-                    </DialLink>
+                    </button>
 
                     {/* Skip Number option just below NEXT # */}
                     <button
