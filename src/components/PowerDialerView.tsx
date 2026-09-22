@@ -16,6 +16,62 @@ import {
   Trash2,
 } from 'lucide-react';
 import { Lead, VA, Disposition } from '../types';
+
+// Determine the owner/contact name associated with a specific phone record on a lead.
+// Mirrors the lookup priority used for the currently targeted number's display name,
+// generalized so it can be run for ANY phone record on the lead. This lets us group /
+// scope phone numbers by owner (see NEXT #, Skip Number, and Next Owner below).
+function getOwnerNameForPhone(lead: Lead, phone: Lead['phoneNumbers'][number]): string {
+  // 1. Direct contactName explicitly set on the phone record
+  if (phone.contactName && phone.contactName.trim()) {
+    return phone.contactName.trim();
+  }
+
+  // 2. Lookup in lead.contacts by phone number match
+  if (lead.contacts && lead.contacts.length > 0) {
+    const matchByNumber = lead.contacts.find((c) =>
+      c.phoneNumbers?.some(
+        (p) =>
+          (p.number && phone.number && p.number.replace(/\D/g, '') === phone.number.replace(/\D/g, '')) ||
+          (phone.id && p.id === phone.id)
+      )
+    );
+    if (matchByNumber && matchByNumber.name && matchByNumber.name.trim()) {
+      return matchByNumber.name.trim();
+    }
+
+    // 3. Lookup in lead.contacts by Owner number parsed from label (e.g. "Owner 2 Phone 1" -> Owner 2)
+    const ownerLabelMatch = phone.label?.match(/Owner\s*(\d+)/i);
+    if (ownerLabelMatch) {
+      const ownerNum = parseInt(ownerLabelMatch[1], 10);
+      const contactByRole = lead.contacts.find(
+        (c) =>
+          c.role?.toLowerCase().includes(`owner ${ownerNum}`) ||
+          c.name?.toLowerCase().includes(`owner ${ownerNum}`)
+      );
+      if (contactByRole && contactByRole.name) return contactByRole.name.trim();
+
+      if (lead.contacts[ownerNum - 1]?.name) {
+        return lead.contacts[ownerNum - 1].name.trim();
+      }
+    }
+  }
+
+  // 4. Check if any other phone record with the same Owner label prefix has a contact name
+  const ownerPrefixMatch = phone.label?.match(/^(Owner\s*\d+)/i);
+  if (ownerPrefixMatch && lead.phoneNumbers) {
+    const prefix = ownerPrefixMatch[1].toLowerCase();
+    const peerPhone = lead.phoneNumbers.find(
+      (p) => p.label?.toLowerCase().startsWith(prefix) && p.contactName && p.contactName.trim()
+    );
+    if (peerPhone && peerPhone.contactName) {
+      return peerPhone.contactName.trim();
+    }
+  }
+
+  // 5. Fallback to the lead's primary ownerName
+  return lead.ownerName || 'Unknown Owner';
+}
 import { isLeadInDealPipeline, isDNCStatus, isLanguageStatus } from '../logic/moveEngine';
 import { VABadge } from './VABadge';
 import { DialLink } from './DialLink';
@@ -261,57 +317,30 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
   // Determine active contact name for whoever's phone number is currently targeted or being dialed
   const displayedOwnerName = useMemo(() => {
     if (!currentLead) return '';
-
-    // 1. Direct contactName explicitly set on the targeted/dialed phone record
-    if (activePhone.contactName && activePhone.contactName.trim()) {
-      return activePhone.contactName.trim();
-    }
-
-    // 2. Lookup in currentLead.contacts by phone number match
-    if (currentLead.contacts && currentLead.contacts.length > 0) {
-      const matchByNumber = currentLead.contacts.find((c) =>
-        c.phoneNumbers?.some(
-          (p) =>
-            (p.number && activePhone.number && p.number.replace(/\D/g, '') === activePhone.number.replace(/\D/g, '')) ||
-            (activePhone.id && p.id === activePhone.id)
-        )
-      );
-      if (matchByNumber && matchByNumber.name && matchByNumber.name.trim()) {
-        return matchByNumber.name.trim();
-      }
-
-      // 3. Lookup in currentLead.contacts by Owner number parsed from label (e.g. "Owner 2 Phone 1" -> Owner 2)
-      const ownerLabelMatch = activePhone.label?.match(/Owner\s*(\d+)/i);
-      if (ownerLabelMatch) {
-        const ownerNum = parseInt(ownerLabelMatch[1], 10);
-        const contactByRole = currentLead.contacts.find(
-          (c) =>
-            c.role?.toLowerCase().includes(`owner ${ownerNum}`) ||
-            c.name?.toLowerCase().includes(`owner ${ownerNum}`)
-        );
-        if (contactByRole && contactByRole.name) return contactByRole.name.trim();
-
-        if (currentLead.contacts[ownerNum - 1]?.name) {
-          return currentLead.contacts[ownerNum - 1].name.trim();
-        }
-      }
-    }
-
-    // 4. Check if any other phone record with the same Owner label prefix has a contact name
-    const ownerPrefixMatch = activePhone.label?.match(/^(Owner\s*\d+)/i);
-    if (ownerPrefixMatch && currentLead.phoneNumbers) {
-      const prefix = ownerPrefixMatch[1].toLowerCase();
-      const peerPhone = currentLead.phoneNumbers.find(
-        (p) => p.label?.toLowerCase().startsWith(prefix) && p.contactName && p.contactName.trim()
-      );
-      if (peerPhone && peerPhone.contactName) {
-        return peerPhone.contactName.trim();
-      }
-    }
-
-    // 5. Fallback to current lead's primary ownerName
-    return currentLead.ownerName || 'Unknown Owner';
+    return getOwnerNameForPhone(currentLead, activePhone);
   }, [currentLead, activePhone]);
+
+  // Owner name for every phone record on this lead, in list order — used to scope
+  // NEXT #, Skip Number, and Next Owner to same-owner groups instead of jumping owners.
+  const phoneOwnerNames = useMemo(() => {
+    if (!currentLead) return [];
+    return currentLead.phoneNumbers.map((p) => getOwnerNameForPhone(currentLead, p));
+  }, [currentLead]);
+
+  // Ordered list of distinct owners as they first appear across this lead's phone numbers
+  const ownerGroups = useMemo(() => {
+    if (!currentLead) return [];
+    const seen = new Set<string>();
+    const groups: { name: string; firstIndex: number }[] = [];
+    phoneOwnerNames.forEach((name, idx) => {
+      const key = name.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        groups.push({ name, firstIndex: idx });
+      }
+    });
+    return groups;
+  }, [currentLead, phoneOwnerNames]);
 
   const handleSelectDispo = (dispo: Disposition) => {
     setSelectedDispo(dispo);
@@ -337,27 +366,62 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
     );
   };
 
+  // Skip Number is scoped the same way as NEXT # — same-owner only. `hasNextNumber` /
+  // `nextPhoneToDial` (declared below) already stop at the current owner's last number.
   const handleSkipNumber = () => {
-    if (!currentLead) return;
-    if (nextDialIdx < currentLead.phoneNumbers.length) {
-      const skippedIdx = nextDialIdx;
-      const targetPhone = currentLead.phoneNumbers[skippedIdx];
-      setCurrentPhoneIndex(skippedIdx);
-      setNextDialIdx(skippedIdx + 1);
-      setIsTimerActive(false);
-      setCallSeconds(0);
-      resetCallState();
-      broadcastDialerSync({
-        phoneIndex: skippedIdx,
-        nextDialIdx: skippedIdx + 1,
-        phoneNumber: targetPhone.number,
-        leadId: currentLead.id,
-      });
-      const targetOwner = targetPhone.contactName || currentLead.ownerName;
-      showToast(`Skipped to ${targetOwner} • ${targetPhone.label} (${targetPhone.number})`);
-    } else {
-      showToast('No more numbers to skip to for this lead.');
+    if (!currentLead || !hasNextNumber || !nextPhoneToDial) {
+      showToast('No more numbers to skip to for this owner.');
+      return;
     }
+    const skippedIdx = nextDialIdx;
+    const targetPhone = nextPhoneToDial;
+    setCurrentPhoneIndex(skippedIdx);
+    setNextDialIdx(skippedIdx + 1);
+    setIsTimerActive(false);
+    setCallSeconds(0);
+    resetCallState();
+    broadcastDialerSync({
+      phoneIndex: skippedIdx,
+      nextDialIdx: skippedIdx + 1,
+      phoneNumber: targetPhone.number,
+      leadId: currentLead.id,
+    });
+    const targetOwner = targetPhone.contactName || currentLead.ownerName;
+    showToast(`Skipped to ${targetOwner} • ${targetPhone.label} (${targetPhone.number})`);
+  };
+
+  // Next Owner: jumps straight to the next distinct owner's first phone number.
+  const handleNextOwner = () => {
+    if (!currentLead || !nextOwnerGroup) {
+      showToast('No more owners for this lead.');
+      return;
+    }
+    const targetIdx = nextOwnerGroup.firstIndex;
+    const targetPhone = currentLead.phoneNumbers[targetIdx];
+    setCurrentPhoneIndex(targetIdx);
+    setNextDialIdx(targetIdx + 1);
+    setIsTimerActive(false);
+    setCallSeconds(0);
+    resetCallState();
+    broadcastDialerSync({
+      phoneIndex: targetIdx,
+      nextDialIdx: targetIdx + 1,
+      phoneNumber: targetPhone.number,
+      leadId: currentLead.id,
+    });
+    showToast(`Jumped to next owner: ${nextOwnerGroup.name} • ${targetPhone.label} (${targetPhone.number})`);
+  };
+
+  // Next Address: advances to the next lead/address in the current dialer queue,
+  // reusing the same lead-navigation logic as the top ChevronRight control. The
+  // existing "lead changed" effect resets phone/owner tracking for the new address.
+  const handleNextAddress = () => {
+    if (!hasNextAddress) {
+      showToast('No more leads/addresses in the queue.');
+      return;
+    }
+    const nextLead = dialerLeads[currentLeadIndex + 1];
+    onLeadChange(nextLead.id);
   };
 
   const handleSubmitDispo = (agent: VA) => {
@@ -489,9 +553,33 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
     }
   };
 
-  // Next Number calculation: next number in order without wrap-around
-  const hasNextNumber = Boolean(currentLead && nextDialIdx < currentLead.phoneNumbers.length);
+  // Owner of the currently targeted phone number (the one CLICK TO DIAL / NEXT # would call)
+  const currentOwnerName = currentLead ? phoneOwnerNames[currentPhoneIndex] || displayedOwnerName : '';
+
+  // Next Number calculation: next number in order, without wrap-around, AND scoped to the
+  // SAME owner as the currently targeted number. Once that owner's last number is reached,
+  // this goes false (greying out NEXT # / Skip Number) instead of jumping to the next owner.
+  const hasNextNumber = Boolean(
+    currentLead &&
+      nextDialIdx < currentLead.phoneNumbers.length &&
+      phoneOwnerNames[nextDialIdx]?.toLowerCase() === currentOwnerName.toLowerCase()
+  );
   const nextPhoneToDial = hasNextNumber ? currentLead.phoneNumbers[nextDialIdx] : undefined;
+
+  // Next Owner calculation: the next distinct owner group after the currently targeted owner
+  const currentOwnerGroupIndex = ownerGroups.findIndex(
+    (g) => g.name.toLowerCase() === currentOwnerName.toLowerCase()
+  );
+  const nextOwnerGroup =
+    currentOwnerGroupIndex >= 0 && currentOwnerGroupIndex < ownerGroups.length - 1
+      ? ownerGroups[currentOwnerGroupIndex + 1]
+      : undefined;
+  const hasNextOwner = Boolean(currentLead && nextOwnerGroup);
+
+  // Next Address calculation: is there another lead after this one in the current dialer queue?
+  const hasNextAddress = Boolean(
+    currentLead && currentLeadIndex >= 0 && currentLeadIndex < dialerLeads.length - 1
+  );
 
   // Lead Queue (Campaign / Agent / Dial status), strictly excluding Deal Pipeline, DNC, or Language Barrier
   const queueCampaigns = Array.from(new Set(dialerLeads.map((l) => l.campaign).filter(Boolean)));
@@ -932,7 +1020,7 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
                         );
                       }}
                       onNoNumber={() => {
-                        showToast('No more numbers for this lead');
+                        showToast('No more numbers for this owner. Use NEXT OWNER to move on.');
                       }}
                       className={`py-2.5 px-3 rounded-md border text-xs font-extrabold flex items-center justify-center gap-1.5 transition-colors no-underline w-full ${
                         hasNextNumber
@@ -942,7 +1030,7 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
                       title={
                         nextPhoneToDial
                           ? `Dial next number: ${nextPhoneToDial.number}`
-                          : 'No more numbers for this lead'
+                          : 'No more numbers for this owner'
                       }
                     >
                       <PhoneForwarded className="w-3.5 h-3.5" />
@@ -973,6 +1061,48 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
                     >
                       <SkipForward className="w-3 h-3 text-[#B85338]" />
                       <span>Skip Number</span>
+                    </button>
+
+                    {/* Next Owner: jumps straight to the next owner's first number */}
+                    <button
+                      type="button"
+                      id="btn-next-owner"
+                      onClick={handleNextOwner}
+                      disabled={!hasNextOwner}
+                      className={`w-full mt-1.5 py-2 px-3 rounded-md border text-xs font-extrabold flex items-center justify-center gap-1.5 transition-colors ${
+                        hasNextOwner
+                          ? 'bg-[#1F2421] text-white border-[#1F2421] hover:bg-[#363E38] cursor-pointer shadow-sm'
+                          : 'bg-[#FFFFFF] text-[#5E6660] border-[#E4E0D6] opacity-60 cursor-not-allowed'
+                      }`}
+                      title={
+                        hasNextOwner && nextOwnerGroup
+                          ? `Jump to next owner: ${nextOwnerGroup.name}`
+                          : 'No more owners for this lead'
+                      }
+                    >
+                      <Users className="w-3.5 h-3.5" />
+                      <span>NEXT OWNER</span>
+                    </button>
+
+                    {/* Next Address: advances to the next lead/address in the queue */}
+                    <button
+                      type="button"
+                      id="btn-next-address"
+                      onClick={handleNextAddress}
+                      disabled={!hasNextAddress}
+                      className={`w-full mt-1.5 py-2 px-3 rounded-md border text-xs font-extrabold flex items-center justify-center gap-1.5 transition-colors ${
+                        hasNextAddress
+                          ? 'bg-[#1F2421] text-white border-[#1F2421] hover:bg-[#363E38] cursor-pointer shadow-sm'
+                          : 'bg-[#FFFFFF] text-[#5E6660] border-[#E4E0D6] opacity-60 cursor-not-allowed'
+                      }`}
+                      title={
+                        hasNextAddress
+                          ? `Advance to next lead/address: ${dialerLeads[currentLeadIndex + 1]?.propertyAddress}`
+                          : 'No more leads in the queue'
+                      }
+                    >
+                      <MapPin className="w-3.5 h-3.5" />
+                      <span>NEXT ADDRESS</span>
                     </button>
                   </div>
                 </div>
