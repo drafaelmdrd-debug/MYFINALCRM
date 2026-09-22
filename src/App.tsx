@@ -36,7 +36,7 @@ import { DNCView } from './components/DNCView';
 import { LanguageBarrierView } from './components/LanguageBarrierView';
 import { NeedsDeepdiveView } from './components/NeedsDeepdiveView';
 import { triggerImmediateDial } from './dialerProtocol';
-import { isLeadInDealPipeline, isDNCStatus, isLanguageStatus } from './logic/moveEngine';
+import { isLeadInDealPipeline, isDNCStatus, isLanguageStatus, isNumberOnlyDispo } from './logic/moveEngine';
 import { LeadDetailDrawer } from './components/LeadDetailDrawer';
 import { BulkImportModal, ImportDestination } from './components/BulkImportModal';
 import { NewLeadModal } from './components/NewLeadModal';
@@ -515,8 +515,56 @@ export default function App() {
         `Number ${dispoPhoneRecord.number} moved to ${targetStage}. Remaining ${remainingPhoneRecords.length} number(s) stay active on Power Dialer.`,
         'Granular Disposition'
       );
+    } else if (isNumberOnlyDispo(disposition)) {
+      // Number-only call outcome disposition (VM, WRONG #, ANS MACHINE, HUNG UP, NO ANSWER, RINGING ONLY, CANNOT DIAL, BEEP/FAX TONE)
+      // "make sure when dispo for VM< WRONG # ,ans machine, hung up. no answer, ringing only, cannot dial, beep/faxtone, it will dispo save to only that number and will not move to other address target, continue on that record, other dispo will remain thesame including movement"
+      const targetPhoneRecord = lead.phoneNumbers.find((p) => p.number === phoneNumber) || lead.phoneNumbers[0];
+      const targetContactName = targetPhoneRecord?.contactName || lead.ownerName;
+
+      const updatedPhones = lead.phoneNumbers.map((p) => {
+        if (p.number === phoneNumber || (targetPhoneRecord && p.id === targetPhoneRecord.id)) {
+          return {
+            ...p,
+            lastDispo: disposition,
+          };
+        }
+        return p;
+      });
+
+      let updatedNotes = lead.callNotes || lead.vaNotes || '';
+      const noteContent = notes.trim()
+        ? `[${disposition} - ${targetPhoneRecord?.number || phoneNumber} (${targetContactName})]: ${notes.trim()}`
+        : `[${disposition} - ${targetPhoneRecord?.number || phoneNumber} (${targetContactName})]`;
+      updatedNotes = appendTimestampedNote(updatedNotes, noteContent);
+
+      const isDispoVA = agent === 'Jah' || agent === 'Jen' || agent === 'Rain';
+      const dispoOwner: VA = isDispoVA
+        ? agent
+        : (['Jah', 'Jen', 'Rain'].includes(lead.assignedVA) ? lead.assignedVA : 'Rain');
+
+      const updatedLead: Lead = {
+        ...lead,
+        phoneNumbers: updatedPhones,
+        callNotes: updatedNotes,
+        vaNotes: updatedNotes,
+        askingPrice: askingPrice || lead.askingPrice,
+        callsCount: lead.callsCount + 1,
+        lastCallDate: formatDateToYYYYMMDD(new Date()),
+        lastDispo: disposition,
+        outreachStatus: `${lead.callsCount + 1} call${lead.callsCount + 1 > 1 ? 's' : ''} logged\nLast: ${disposition} (${targetPhoneRecord?.number || phoneNumber})`,
+        assignedVA: dispoOwner,
+      };
+
+      newLeads = leads.map((l) => (l.id === updatedLead.id ? updatedLead : l));
+      setLeads(newLeads);
+
+      if (selectedLead?.id === lead.id) {
+        setSelectedLead(updatedLead);
+      }
+
+      // Explicitly stay on THIS lead record (do NOT advance to other address target)
     } else {
-      // Standard disposition flow (keep everything on disposition the same)
+      // Standard disposition flow with stage movement (Interested, Callback, Follow-Up, DNC, Spanish, etc.)
       const updatedPhones = lead.phoneNumbers.map((p) => {
         if (p.number === phoneNumber) {
           return {
@@ -566,9 +614,10 @@ export default function App() {
         setSelectedLead(updatedLead);
       }
 
-      // If moved to Deal Pipeline, DNC, or Language Barrier, advance active dialer lead
-      const remainingDialerLeads = newLeads.filter((l) => !isLeadInDealPipeline(l));
-      if (activeDialerLeadId === leadId) {
+      // Only advance active dialer lead IF this lead was actually moved out of the dialer workspace
+      const isMovedOutOfDialer = isLeadInDealPipeline(updatedLead);
+      if (isMovedOutOfDialer && activeDialerLeadId === leadId) {
+        const remainingDialerLeads = newLeads.filter((l) => !isLeadInDealPipeline(l));
         const nextLead = remainingDialerLeads.find((l) => l.id !== leadId) || remainingDialerLeads[0];
         if (nextLead) {
           setActiveDialerLeadId(nextLead.id);
