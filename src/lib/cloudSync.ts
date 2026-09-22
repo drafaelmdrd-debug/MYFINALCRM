@@ -15,11 +15,15 @@ const TABLE = 'crm_state';
  *   don't try to read/write before the user is signed in.
  * - Other signed-in users' changes arrive automatically via Supabase Realtime.
  *
- * Returns [value, setValue, loaded] — same shape as useState plus a loaded flag.
+ * Returns [value, setValue, loaded, error] — same shape as useState plus a
+ * loaded flag and the last load/save error (null when everything's fine).
+ * `error` is cleared automatically the next time a save succeeds, so
+ * consumers can surface it (e.g. a toast) without tracking it themselves.
  */
 export function useCloudState<T>(key: string, initialValue: T, enabled: boolean) {
   const [state, setState] = useState<T>(initialValue);
   const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const skipNextSave = useRef(false);
   const loadedRef = useRef(false);
 
@@ -29,12 +33,13 @@ export function useCloudState<T>(key: string, initialValue: T, enabled: boolean)
     let cancelled = false;
 
     (async () => {
-      const { data, error } = await supabase.from(TABLE).select('value').eq('id', key).maybeSingle();
+      const { data, error: loadError } = await supabase.from(TABLE).select('value').eq('id', key).maybeSingle();
 
       if (cancelled) return;
 
-      if (error) {
-        console.error(`[cloudSync] Failed to load "${key}"`, error);
+      if (loadError) {
+        console.error(`[cloudSync] Failed to load "${key}"`, loadError);
+        setError(`Couldn't load "${key}" from the shared workspace (${loadError.message}). Showing local data — it may be out of date.`);
       } else if (data) {
         skipNextSave.current = true;
         setState(data.value as T);
@@ -45,6 +50,7 @@ export function useCloudState<T>(key: string, initialValue: T, enabled: boolean)
           .upsert({ id: key, value: initialValue as unknown as object });
         if (insertError) {
           console.error(`[cloudSync] Failed to seed "${key}"`, insertError);
+          setError(`Couldn't initialize "${key}" in the shared workspace (${insertError.message}).`);
         }
       }
 
@@ -94,11 +100,16 @@ export function useCloudState<T>(key: string, initialValue: T, enabled: boolean)
     supabase
       .from(TABLE)
       .upsert({ id: key, value: state as unknown as object, updated_at: new Date().toISOString() })
-      .then(({ error }) => {
-        if (error) console.error(`[cloudSync] Failed to save "${key}"`, error);
+      .then(({ error: saveError }) => {
+        if (saveError) {
+          console.error(`[cloudSync] Failed to save "${key}"`, saveError);
+          setError(`Couldn't save "${key}" to the shared workspace (${saveError.message}). Your latest change is NOT saved — reloading the page will lose it.`);
+        } else {
+          setError(null);
+        }
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state, enabled]);
 
-  return [state, setState, loaded] as const;
+  return [state, setState, loaded, error] as const;
 }
