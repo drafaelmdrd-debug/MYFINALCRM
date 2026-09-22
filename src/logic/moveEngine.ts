@@ -99,6 +99,32 @@ export function isNeedsDeepdiveStatus(status: string): boolean {
 }
 
 /**
+ * Call outcome dispositions that only apply to the specific phone number dialed
+ * and MUST NOT move the lead out of the calling list / dialer or advance to another address target.
+ * "VM, WRONG #, ANS MACHINE, HUNG UP, NO ANSWER, RINGING ONLY, CANNOT DIAL, BEEP/FAX TONE"
+ */
+export function isNumberOnlyDispo(status: string): boolean {
+  const s = (status || '').trim().toUpperCase();
+  return (
+    s === 'VM' ||
+    s === 'WRONG #' ||
+    s === 'WRONG NUMBER' ||
+    s === 'ANS MACHINE' ||
+    s === 'ANSWERING MACHINE' ||
+    s === 'HUNG UP' ||
+    s === 'NO ANSWER' ||
+    s === 'RINGING ONLY' ||
+    s === 'CANNOT BE DIALED / NOT IN SERVICE' ||
+    s === 'CANNOT DIAL' ||
+    s === 'DC/ NOT A WORKING #' ||
+    s === 'DC / NOT A WORKING #' ||
+    s === 'BEEP/FAX TONE' ||
+    s === 'BEEP / FAX TONE' ||
+    s === 'FAX TONE'
+  );
+}
+
+/**
  * Checks if a lead has been tagged to ANY Deal Pipeline stage or status
  * (Project Mgmt, Follow-Up, DNC, Language Barrier, Needs Skiptracing/Deepdive, or corresponding statuses).
  * When tagged, the lead must be removed from cold Calling Lists.
@@ -259,6 +285,15 @@ export function routeLead(
         outreachStatus: 'Unresponsive',
       },
       reason: 'Status set to Unresponsive (no stage change)',
+    };
+  }
+
+  // Number-only call outcome dispositions (VM, WRONG #, ANS MACHINE, HUNG UP, NO ANSWER, RINGING ONLY, CANNOT DIAL, BEEP/FAX TONE)
+  // NEVER trigger stage movement or route to deal pipeline
+  if (isNumberOnlyDispo(cleanStatus)) {
+    return {
+      updatedLead: lead,
+      reason: `Number-only disposition (${cleanStatus}) saved to phone number - no stage movement`,
     };
   }
 
