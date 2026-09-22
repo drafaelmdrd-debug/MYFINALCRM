@@ -72,7 +72,7 @@ function getOwnerNameForPhone(lead: Lead, phone: Lead['phoneNumbers'][number]): 
   // 5. Fallback to the lead's primary ownerName
   return lead.ownerName || 'Unknown Owner';
 }
-import { isLeadInDealPipeline, isDNCStatus, isLanguageStatus } from '../logic/moveEngine';
+import { isLeadInDealPipeline, isDNCStatus, isLanguageStatus, isNumberOnlyDispo } from '../logic/moveEngine';
 import { VABadge } from './VABadge';
 import { DialLink } from './DialLink';
 import { DialerModeSelector } from './DialerModeSelector';
@@ -353,6 +353,7 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
   const handleSelectPhone = (idx: number) => {
     if (!currentLead || !currentLead.phoneNumbers[idx]) return;
     setCurrentPhoneIndex(idx);
+    setNextDialIdx(idx + 1);
     const targetPhone = currentLead.phoneNumbers[idx];
     broadcastDialerSync({
       phoneIndex: idx,
@@ -373,7 +374,7 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
       showToast('No more numbers to skip to for this owner.');
       return;
     }
-    const skippedIdx = nextDialIdx;
+    const skippedIdx = currentPhoneIndex + 1;
     const targetPhone = nextPhoneToDial;
     setCurrentPhoneIndex(skippedIdx);
     setNextDialIdx(skippedIdx + 1);
@@ -431,9 +432,6 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
     }
     if (!currentLead) return;
 
-    const isSpecialGranular = isDNCStatus(selectedDispo) || isLanguageStatus(selectedDispo);
-    const hasRemainingPhones = currentLead.phoneNumbers.length > 1;
-
     setIsTimerActive(false);
     setCallSeconds(0);
     resetCallState();
@@ -448,24 +446,27 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
       true
     );
 
-    if (isSpecialGranular && hasRemainingPhones) {
-      showToast(
-        `✅ Number ${activePhone.number} (${displayedOwnerName}) moved to ${selectedDispo}. ${currentLead.phoneNumbers.length - 1} number(s) remain on dialer.`
-      );
-      // Reset target phone index to 0 so the agent can immediately continue calling remaining numbers
-      setCurrentPhoneIndex(0);
-      setNextDialIdx(1);
-    } else if (hasRemainingPhones && currentPhoneIndex < currentLead.phoneNumbers.length - 1) {
-      const nextIdx = currentPhoneIndex + 1;
-      setCurrentPhoneIndex(nextIdx);
-      setNextDialIdx(nextIdx + 1);
-      showToast(
-        `✅ Saved ${agent} | ${selectedDispo}. Switched to phone #${nextIdx + 1} (${currentLead.phoneNumbers[nextIdx].number}).`
-      );
-    } else {
-      showToast(`✅ Saved: ${agent} | ${selectedDispo} | ${displayedOwnerName} (${activePhone.number})`);
-      setLastSavedLead(currentLead);
-    }
+    // CRITICAL: Do NOT change the number on view upon dispo!
+    // The number on view remains on the exact phone record that was just dialed and dispo'd.
+    // The agent will use:
+    // - NEXT # to proceed with the next number to call
+    // - NEXT OWNER to proceed to the next owner
+    // - NEXT ADDRESS to proceed to the next address
+    setNextDialIdx(currentPhoneIndex + 1);
+
+    broadcastDialerSync({
+      phoneIndex: currentPhoneIndex,
+      nextDialIdx: currentPhoneIndex + 1,
+      phoneNumber: activePhone.number,
+      leadId: currentLead.id,
+      selectedDispo: null,
+      notes: '',
+    });
+
+    showToast(
+      `✅ Saved ${agent} | ${selectedDispo} on ${activePhone.number || 'No Phone'} (${displayedOwnerName}). Use NEXT # to proceed to the next number.`
+    );
+    setLastSavedLead(currentLead);
 
     setSelectedDispo(null);
     setNotes('');
@@ -556,15 +557,18 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
   // Owner of the currently targeted phone number (the one CLICK TO DIAL / NEXT # would call)
   const currentOwnerName = currentLead ? phoneOwnerNames[currentPhoneIndex] || displayedOwnerName : '';
 
+  // Next Number index in order: the number right after the currently targeted phone number
+  const nextTargetPhoneIdx = currentPhoneIndex + 1;
+
   // Next Number calculation: next number in order, without wrap-around, AND scoped to the
   // SAME owner as the currently targeted number. Once that owner's last number is reached,
   // this goes false (greying out NEXT # / Skip Number) instead of jumping to the next owner.
   const hasNextNumber = Boolean(
     currentLead &&
-      nextDialIdx < currentLead.phoneNumbers.length &&
-      phoneOwnerNames[nextDialIdx]?.toLowerCase() === currentOwnerName.toLowerCase()
+      nextTargetPhoneIdx < currentLead.phoneNumbers.length &&
+      phoneOwnerNames[nextTargetPhoneIdx]?.toLowerCase() === currentOwnerName.toLowerCase()
   );
-  const nextPhoneToDial = hasNextNumber ? currentLead.phoneNumbers[nextDialIdx] : undefined;
+  const nextPhoneToDial = hasNextNumber ? currentLead.phoneNumbers[nextTargetPhoneIdx] : undefined;
 
   // Next Owner calculation: the next distinct owner group after the currently targeted owner
   const currentOwnerGroupIndex = ownerGroups.findIndex(
@@ -947,50 +951,38 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
                   )}
                 </div>
 
-                {/* Dial Controls: CLICK TO DIAL on first number only, NEXT # for succeeding numbers */}
+                {/* Dial Controls: CLICK TO DIAL / CALL (current number on view), NEXT # for succeeding numbers */}
                 <div className="grid grid-cols-2 gap-2 pt-1 items-start">
                   <div>
-                    {currentPhoneIndex === 0 ? (
-                      <DialLink
-                        id="btn-call-number"
-                        number={activePhone.number}
-                        leadId={currentLead.id}
-                        onDial={({ number }) => {
-                          const nextIdx = 1;
-                          setNextDialIdx(nextIdx);
-                          setIsTimerActive(true);
-                          setCallSeconds(0);
-                          broadcastDialerSync({
-                            action: 'dial',
-                            phoneIndex: 0,
-                            nextDialIdx: nextIdx,
-                            phoneNumber: number,
-                            leadId: currentLead.id,
-                            isCalling: true,
-                            callSeconds: 0,
-                          });
-                          showToast(`Dialing ${displayedOwnerName} (${activePhone.label}): ${number}...`);
-                        }}
-                        onNoNumber={() => {
-                          showToast('⚠️ No phone number available to call for this lead.');
-                        }}
-                        className="py-2.5 px-3 rounded-md bg-[#4A7A5E] hover:bg-[#3E654E] text-white font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-sm transition-colors cursor-pointer no-underline w-full"
-                        title={`Click to dial 1st number: ${activePhone.number}`}
-                      >
-                        <Phone className="w-3.5 h-3.5 fill-white" />
-                        <span>CLICK TO DIAL / CALL</span>
-                      </DialLink>
-                    ) : (
-                      <button
-                        type="button"
-                        disabled
-                        className="py-2.5 px-3 rounded-md bg-[#E4E0D6]/60 text-[#5E6660] font-bold text-xs flex items-center justify-center gap-1.5 cursor-not-allowed opacity-70 w-full"
-                        title="1st number already dialed. Use NEXT # to dial succeeding numbers."
-                      >
-                        <Phone className="w-3.5 h-3.5 opacity-50" />
-                        <span>CLICK TO DIAL</span>
-                      </button>
-                    )}
+                    <DialLink
+                      id="btn-call-number"
+                      number={activePhone.number}
+                      leadId={currentLead.id}
+                      onDial={({ number }) => {
+                        const nextIdx = currentPhoneIndex + 1;
+                        setNextDialIdx(nextIdx);
+                        setIsTimerActive(true);
+                        setCallSeconds(0);
+                        broadcastDialerSync({
+                          action: 'dial',
+                          phoneIndex: currentPhoneIndex,
+                          nextDialIdx: nextIdx,
+                          phoneNumber: number,
+                          leadId: currentLead.id,
+                          isCalling: true,
+                          callSeconds: 0,
+                        });
+                        showToast(`Dialing ${displayedOwnerName} (${activePhone.label}): ${number}...`);
+                      }}
+                      onNoNumber={() => {
+                        showToast('⚠️ No phone number available to call for this lead.');
+                      }}
+                      className="py-2.5 px-3 rounded-md bg-[#4A7A5E] hover:bg-[#3E654E] text-white font-extrabold text-xs flex items-center justify-center gap-1.5 shadow-sm transition-colors cursor-pointer no-underline w-full"
+                      title={activePhone.number ? `Click to dial current number: ${activePhone.number}` : 'No phone number'}
+                    >
+                      <Phone className="w-3.5 h-3.5 fill-white" />
+                      <span>CLICK TO DIAL / CALL</span>
+                    </DialLink>
                   </div>
 
                   <div>
@@ -999,8 +991,8 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
                       number={nextPhoneToDial?.number}
                       leadId={currentLead.id}
                       onDial={({ number }) => {
-                        const newTargetIdx = nextDialIdx;
-                        const newNextIdx = nextDialIdx + 1;
+                        const newTargetIdx = currentPhoneIndex + 1;
+                        const newNextIdx = newTargetIdx + 1;
                         setCurrentPhoneIndex(newTargetIdx);
                         setNextDialIdx(newNextIdx);
                         setIsTimerActive(true);
@@ -1037,7 +1029,7 @@ export const PowerDialerView: React.FC<PowerDialerViewProps> = ({
                       <span>NEXT #</span>
                       {currentLead.phoneNumbers.length > 0 && (
                         <span className="text-[10px] opacity-80 font-mono">
-                          ({Math.min(nextDialIdx + 1, currentLead.phoneNumbers.length)}/{currentLead.phoneNumbers.length})
+                          ({Math.min(currentPhoneIndex + 2, currentLead.phoneNumbers.length)}/{currentLead.phoneNumbers.length})
                         </span>
                       )}
                     </DialLink>
