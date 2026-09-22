@@ -43,7 +43,7 @@ import { NewLeadModal } from './components/NewLeadModal';
 import { ExportModal } from './components/ExportModal';
 import { defaultGroupsForView } from './logic/exportLeads';
 import { subscribeDialerSync } from './utils/dialerSyncChannel';
-import { CheckCircle2 } from 'lucide-react';
+import { CheckCircle2, AlertTriangle, X } from 'lucide-react';
 import { useAuth } from './lib/AuthContext';
 import { LoginScreen } from './components/LoginScreen';
 import { useCloudState } from './lib/cloudSync';
@@ -66,10 +66,14 @@ export default function App() {
   const signedIn = !!session;
 
   // Master Leads State — shared across every signed-in user via Supabase
-  const [leads, setLeads, leadsLoaded] = useCloudState<Lead[]>('leads', INITIAL_LEADS, signedIn);
+  const [leads, setLeads, leadsLoaded, leadsSyncError] = useCloudState<Lead[]>(
+    'leads',
+    INITIAL_LEADS,
+    signedIn
+  );
 
   // Campaigns State — shared
-  const [campaigns, setCampaigns] = useCloudState<string[]>(
+  const [campaigns, setCampaigns, , campaignsSyncError] = useCloudState<string[]>(
     'campaigns',
     DEFAULT_CAMPAIGNS,
     signedIn
@@ -128,6 +132,14 @@ export default function App() {
   const [isNewLeadModalOpen, setIsNewLeadModalOpen] = useState<boolean>(false);
   const [isExportOpen, setIsExportOpen] = useState<boolean>(false);
   const [toast, setToast] = useState<{ message: string; sub?: string } | null>(null);
+
+  // Surfaces cloud sync failures (e.g. a bulk import that updated the
+  // screen but failed to persist to Supabase). Unlike `toast`, this does
+  // NOT auto-dismiss — losing data silently is exactly the bug this is
+  // here to prevent, so it stays up until the user closes it or the sync
+  // actually succeeds.
+  const syncError = leadsSyncError || campaignsSyncError;
+  const [dismissedSyncError, setDismissedSyncError] = useState<string | null>(null);
 
   // Once leads have loaded from the shared workspace, recompile today's task
   // board from them (the initial `tasks` state above was built from the
@@ -871,6 +883,24 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F8F6F1] text-[#1F2421] selection:bg-[#B85338]/20 selection:text-[#B85338]">
+      {/* Cloud Sync Error Banner — stays up until dismissed or the sync recovers */}
+      {syncError && syncError !== dismissedSyncError && (
+        <div className="fixed top-16 right-6 z-50 bg-red-50 text-red-900 px-4 py-3 rounded-lg shadow-2xl border border-red-200 flex items-start gap-3 animate-in fade-in slide-in-from-top-2 duration-200 max-w-md">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
+          <div className="text-xs space-y-0.5 flex-1">
+            <div className="font-bold">Sync problem</div>
+            <div className="text-red-800 text-[11px]">{syncError}</div>
+          </div>
+          <button
+            onClick={() => setDismissedSyncError(syncError)}
+            className="text-red-400 hover:text-red-700 shrink-0"
+            aria-label="Dismiss"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
       {/* Toast Notification Banner */}
       {toast && (
         <div className="fixed top-16 right-6 z-50 bg-[#1F2421] text-white px-4 py-3 rounded-lg shadow-2xl border border-[#E4E0D6]/20 flex items-start gap-3 animate-in fade-in slide-in-from-top-2 duration-200 max-w-md">
