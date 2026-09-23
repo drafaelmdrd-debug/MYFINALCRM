@@ -19,7 +19,7 @@ import {
   FileSearch,
 } from 'lucide-react';
 import { Lead, VA, StageId, SourceTabId, ContactPerson, PhoneNumberRecord } from '../types';
-import { routeLead } from '../logic/moveEngine';
+import { routeLead, isFollowupStatus } from '../logic/moveEngine';
 
 export type ImportDestination = 'existing_campaign' | 'new_campaign' | 'deal_pipeline' | 'needs_skiptracing';
 
@@ -39,10 +39,10 @@ Elena Rostova,1904 Cedar Crest Blvd,Dallas,75203,PO Box 8912 Plano TX 75024,(214
 Thomas Sterling,820 E 12th St,Dallas,75203,1502 N Main St Fort Worth TX 76102,(214) 771-4091,(972) 341-9022,,Margaret Sterling,(214) 771-4095,,,`;
 
 // Sample Deal Pipeline CSV
-const SAMPLE_DEAL_PIPELINE_CSV = `Owner Name,Address,City,Zip,Mailing Address,Phone Number,Asking Price,Notes,Starting Offer,Max Offer,Counter Offer
-Arthur Pendelton,742 Evergreen Terrace,Dallas,75201,742 Evergreen Terrace Dallas TX 75201,(214) 883-9102,$240,000,Heirs agreed to sell quickly,$190,000,$215,000,$230,000
-Brenda Vance,1209 Oak Ridge Lane,Dallas,75208,401 Wilshire Blvd Santa Monica CA 90401,(214) 902-3341,$175,000,Needs roof and foundation work,$135,000,$155,000,
-Carlos Gutierrez,3318 Pecan Blvd,Dallas,75216,3318 Pecan Blvd Dallas TX 75216,(972) 551-7788,$310,000,Vacant rental property,$250,000,$285,000,$295,000`;
+const SAMPLE_DEAL_PIPELINE_CSV = `Owner Name,Address,City,Zip,Mailing Address,Phone Number,Asking Price,Notes,Starting Offer,Max Offer,Counter Offer,Status
+Arthur Pendelton,742 Evergreen Terrace,Dallas,75201,742 Evergreen Terrace Dallas TX 75201,(214) 883-9102,$240,000,Heirs agreed to sell quickly,$190,000,$215,000,$230,000,Interested - Has Asking Price
+Brenda Vance,1209 Oak Ridge Lane,Dallas,75208,401 Wilshire Blvd Santa Monica CA 90401,(214) 902-3341,$175,000,Needs roof and foundation work,$135,000,$155,000,,Interested
+Carlos Gutierrez,3318 Pecan Blvd,Dallas,75216,3318 Pecan Blvd Dallas TX 75216,(972) 551-7788,$310,000,Vacant rental property,$250,000,$285,000,$295,000,Not Ready to Sell - 60 Days`;
 
 const PROJECT_MGMT_STATUSES = [
   'Interested',
@@ -89,6 +89,7 @@ export type StandardField =
   | 'startingOffer'
   | 'maxOffer'
   | 'counterOffer'
+  | 'status'
   | 'owner1Name'
   | 'owner1Phone1'
   | 'owner1Phone2'
@@ -101,6 +102,62 @@ export type StandardField =
   | 'owner3Phone1'
   | 'owner3Phone2'
   | 'owner3Phone3';
+
+// Statuses a Deal Pipeline import row can be mapped to (grouped by the stage each one routes to).
+const IMPORT_STATUS_GROUPS: { label: string; options: string[] }[] = [
+  { label: 'Project Mgmt', options: [...PROJECT_MGMT_STATUSES, 'Comps Needed'] },
+  { label: 'Follow-Up', options: FOLLOW_UP_STATUSES },
+];
+const ALL_IMPORT_STATUSES = IMPORT_STATUS_GROUPS.flatMap((g) => g.options);
+
+const normStatusText = (s: string): string =>
+  (s || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+
+/**
+ * Turn whatever text is in a spreadsheet's Status/Stage column ("interested had asking price",
+ * "NOT INTERESTED 60", "call back tomorrow", "Project Mgmt"…) into one of the CRM's real
+ * statuses. Returns '' when it can't tell, so the row falls back to the default status.
+ */
+export const detectImportStatus = (raw: string): string => {
+  const n = normStatusText(raw);
+  if (!n) return '';
+
+  // Exact match with a real status (ignoring case / punctuation)
+  const exact = ALL_IMPORT_STATUSES.find((st) => normStatusText(st) === n);
+  if (exact) return exact;
+
+  const days = (n.match(/\b(30|60|90)\b/) || [])[1];
+
+  if (/\bnot interested\b|^ni\b/.test(n)) return `Not Interested - ${days || '30'} Days`;
+  if (/\bnot ready\b|^nr\b/.test(n)) return `Not Ready to Sell - ${days || '30'} Days`;
+
+  if (/\b(has|had|with) (an )?asking price\b/.test(n)) return 'Interested - Has Asking Price';
+  if (/\binterested\b/.test(n)) {
+    return /\basking\b|\bprice\b/.test(n) ? 'Interested - Has Asking Price' : 'Interested';
+  }
+  if (/\bcomps?\b/.test(n)) return n.includes('needed') || n.includes('need') ? 'Comps Needed' : 'For Comps';
+  if (/\basking\b.*\bhigh\b/.test(n)) return 'Asking Too High';
+  if (/\bcall ?back\b/.test(n)) return /\btomorrow\b/.test(n) ? 'Callback Tomorrow' : 'Callback';
+  if (/\bappointment\b|\bin person\b/.test(n)) return 'Appointment In Person';
+  if (/\blisted\b|\bmls\b/.test(n)) return 'Listed';
+  if (/\bunder contract\b/.test(n)) return 'Under Contract';
+  if (/\bcontract sent\b/.test(n)) return 'Contract Sent';
+  if (/\bcontract signed\b|\bsigned\b/.test(n)) return 'Contract Signed';
+  if (/\brejected\b/.test(n)) return 'Rejected Offer';
+  if (/\baccepted\b/.test(n)) return 'Accepted Offer';
+  if (/\boffer made\b|\bmade offer\b/.test(n)) return 'Offer Made';
+  if (/\bfor offer\b/.test(n)) return 'For Offer';
+  if (/\bnegotiat/.test(n)) return 'Negotiating';
+  if (/\bdeal won\b|\bwon\b/.test(n)) return 'Deal Won';
+
+  // Stage names on their own
+  if (/^project (mgmt|management|mgt)$/.test(n)) return 'Interested';
+  if (/^follow ?up$/.test(n)) return 'Not Interested - 30 Days';
+  return '';
+};
 
 // Helper to detect if a text string looks like a call log, date stamp, or note rather than a person's name
 const isNoteOrDateText = (text: string): boolean => {
@@ -284,6 +341,9 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
   const [parseError, setParseError] = useState<string | null>(null);
   const [showMappingConfig, setShowMappingConfig] = useState<boolean>(false);
   const [customMappings, setCustomMappings] = useState<Record<number, StandardField>>({});
+  // Stage/status mapping for Deal Pipeline imports: text found in the file -> CRM status
+  // ('' = use the default status chosen above). Anything not listed here is auto-detected.
+  const [statusOverrides, setStatusOverrides] = useState<Record<string, string>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 1. Raw parsing of lines and columns respecting multi-line quotes
@@ -385,6 +445,12 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
         return;
       }
 
+      // Status / Stage column (Deal Pipeline imports: Interested, Interested - Has Asking Price, ...)
+      if ((lower.includes('status') || lower.includes('stage')) && !lower.includes('phone')) {
+        mappings[idx] = 'status';
+        return;
+      }
+
       // Generic Phone & Name
       if (lower.includes('phone') || lower.includes('cell') || lower.includes('mobile')) {
         mappings[idx] = 'phone';
@@ -410,6 +476,38 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
     });
     return combined;
   }, [defaultAutoMappings, customMappings]);
+
+  // Distinct values found in the Status/Stage column(s), with how many rows use each
+  const statusColumnIdxs = useMemo(
+    () =>
+      Object.keys(activeMappings)
+        .map(Number)
+        .filter((i) => activeMappings[i] === 'status'),
+    [activeMappings]
+  );
+  const foundStatuses = useMemo(() => {
+    const counts = new Map<string, { raw: string; count: number }>();
+    if (statusColumnIdxs.length === 0) return [];
+    parsedSheet.rows.forEach((cols) => {
+      statusColumnIdxs.forEach((i) => {
+        const raw = (cols[i] || '').trim();
+        if (!raw) return;
+        const key = normStatusText(raw);
+        if (!key) return;
+        const cur = counts.get(key);
+        if (cur) cur.count += 1;
+        else counts.set(key, { raw, count: 1 });
+      });
+    });
+    return Array.from(counts.entries()).map(([key, v]) => ({ key, ...v }));
+  }, [parsedSheet, statusColumnIdxs]);
+
+  // What a given Status/Stage cell will become ('' = fall back to the default status)
+  const resolveImportStatus = (raw: string): string => {
+    const key = normStatusText(raw);
+    if (key in statusOverrides) return statusOverrides[key];
+    return detectImportStatus(raw);
+  };
 
   // 3. Process each row into structured Lead objects
   const parsedLeads = useMemo(() => {
@@ -478,6 +576,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
       let startingOffer = '';
       let maxOffer = '';
       let counterOffer = '';
+      let rowStatusRaw = '';
 
       // Owner-specific maps
       const ownerNames: Record<number, string> = {};
@@ -544,6 +643,9 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
             break;
           case 'counterOffer':
             if (cleanVal) counterOffer = cleanVal;
+            break;
+          case 'status':
+            if (cleanVal && !rowStatusRaw) rowStatusRaw = cleanVal;
             break;
 
           // Owner 1
@@ -695,6 +797,17 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
         }
       }
 
+      // Deal Pipeline: a Status/Stage value in the file decides where this row lands
+      let rowStatus = targetStatus;
+      let rowStage: StageId = targetStage;
+      if (destination === 'deal_pipeline' && rowStatusRaw) {
+        const mapped = resolveImportStatus(rowStatusRaw);
+        if (mapped) {
+          rowStatus = mapped;
+          rowStage = isFollowupStatus(mapped) ? 'Follow-Up' : 'Project Mgmt';
+        }
+      }
+
       const initialLead: Lead = {
         id: `lead-${Date.now()}-${rowIdx}`,
         leadId: `IMP-${Math.floor(1000 + Math.random() * 9000)}`,
@@ -708,15 +821,15 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
         phoneNumbers: phoneRecords,
         contacts: contactsList.length > 0 ? contactsList : undefined,
         campaign: finalCampaign,
-        stageId: targetStage,
+        stageId: rowStage,
         sourceTab: (finalCampaign.slice(0, 20) as SourceTabId) || 'Dallas',
         assignedVA,
-        vaStatus: destination === 'needs_skiptracing' ? 'Newly Added' : targetStatus,
+        vaStatus: destination === 'needs_skiptracing' ? 'Newly Added' : rowStatus,
         outreachStatus:
           destination === 'needs_skiptracing'
             ? 'Newly Added'
             : destination === 'deal_pipeline'
-            ? targetStatus
+            ? rowStatus
             : 'Not yet dialed',
         promotedToPipeline: destination === 'needs_skiptracing' ? true : undefined,
         dateAddedToDeepdive: destination === 'needs_skiptracing' ? new Date().toISOString() : undefined,
@@ -730,7 +843,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
       };
 
       if (destination === 'deal_pipeline') {
-        const routed = routeLead(initialLead, targetStatus);
+        const routed = routeLead(initialLead, rowStatus);
         leads.push(routed.updatedLead);
       } else {
         leads.push(initialLead);
@@ -738,7 +851,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
     });
 
     return leads;
-  }, [parsedSheet, activeMappings, destination, selectedCampaign, newCampaignName, pipelineStage, pipelineStatus, assignedVA]);
+  }, [parsedSheet, activeMappings, destination, selectedCampaign, newCampaignName, pipelineStage, pipelineStatus, assignedVA, statusOverrides]);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -766,6 +879,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
       setDestination('deal_pipeline');
     }
     setCustomMappings({});
+    setStatusOverrides({});
     setParseError(null);
   };
 
@@ -1106,7 +1220,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
               }}
               placeholder={
                 destination === 'deal_pipeline'
-                  ? `Paste rows from Excel, Google Sheets, or CSV file here...\nFormat: Owner Name, Address, City, Zip, Phone Number, Asking Price, Notes, Starting Offer, Max Offer, Counter Offer`
+                  ? `Paste rows from Excel, Google Sheets, or CSV file here...\nFormat: Owner Name, Address, City, Zip, Phone Number, Asking Price, Notes, Starting Offer, Max Offer, Counter Offer, Status`
                   : `Paste rows from Excel, Google Sheets, or CSV file here...\nFormat: Owner 1 Name, Address, City, Zip, Owner 1 Phone 1, Owner 1 Phone 2, Owner 1 Phone 3, Owner 2 Name, Owner 2 Phone 1...`
               }
               className="w-full h-32 p-3 text-xs font-mono bg-[#FDFBF7] border border-[#E4E0D6] rounded-lg outline-none focus:border-[#B85338] resize-none leading-relaxed placeholder:text-[#8C948E]"
@@ -1199,6 +1313,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
                           <option value="startingOffer">Starting Offer</option>
                           <option value="maxOffer">Max Offer</option>
                           <option value="counterOffer">Counter Offer</option>
+                          <option value="status">Status / Stage (Interested, Has Asking Price…)</option>
                         </optgroup>
                         <optgroup label="Multi-Owner: Owner 1">
                           <option value="owner1Name">Owner 1 Name</option>
@@ -1224,6 +1339,65 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
                 </div>
               </div>
             )}
+          </div>
+        )}
+
+        {/* Stage / Status mapping for Deal Pipeline imports */}
+        {destination === 'deal_pipeline' && foundStatuses.length > 0 && (
+          <div className="border border-[#E4E0D6] rounded-lg overflow-hidden bg-white">
+            <div className="p-2.5 bg-[#F8F6F1] flex items-center gap-2">
+              <Kanban className="w-4 h-4 text-[#B85338]" />
+              <span className="text-xs font-bold text-[#1F2421]">
+                Stage / Status Mapping ({foundStatuses.length} value{foundStatuses.length === 1 ? '' : 's'} found in your file)
+              </span>
+            </div>
+            <div className="p-3 border-t border-[#E4E0D6] max-h-48 overflow-y-auto space-y-1.5">
+              <p className="text-[11px] text-[#5E6660]">
+                Each status in your data is matched to a CRM status, which also decides the stage it lands in
+                (Project Mgmt or Follow-Up). Change any that were matched wrong. Rows with no status use the
+                default <strong>{pipelineStatus}</strong>.
+              </p>
+              {foundStatuses.map((fs) => {
+                const mapped = resolveImportStatus(fs.raw);
+                return (
+                  <div
+                    key={fs.key}
+                    className="flex items-center justify-between gap-3 p-2 rounded bg-[#FDFBF7] border border-[#E4E0D6]"
+                  >
+                    <div className="min-w-0 text-xs">
+                      <span className="font-mono font-bold text-[#1F2421] truncate">“{fs.raw}”</span>
+                      <span className="ml-2 text-[11px] text-[#5E6660]">
+                        {fs.count} row{fs.count === 1 ? '' : 's'}
+                      </span>
+                      {!mapped && (
+                        <span className="ml-2 text-[10px] font-bold text-amber-700">not recognised → default status</span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <ArrowRight className="w-3.5 h-3.5 text-[#5E6660]" />
+                      <select
+                        value={mapped}
+                        onChange={(e) =>
+                          setStatusOverrides((prev) => ({ ...prev, [fs.key]: e.target.value }))
+                        }
+                        className="bg-white border border-[#E4E0D6] rounded px-2 py-1 text-xs font-semibold text-[#1F2421] outline-none focus:border-[#B85338]"
+                      >
+                        <option value="">Use default ({pipelineStatus})</option>
+                        {IMPORT_STATUS_GROUPS.map((g) => (
+                          <optgroup key={g.label} label={g.label}>
+                            {g.options.map((st) => (
+                              <option key={st} value={st}>
+                                {st}
+                              </option>
+                            ))}
+                          </optgroup>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
 
@@ -1256,6 +1430,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
                       <th className="px-2.5 py-1.5">Max Offer</th>
                       <th className="px-2.5 py-1.5">Counter Offer</th>
                       <th className="px-2.5 py-1.5">Notes</th>
+                      <th className="px-2.5 py-1.5">Stage › Status</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#E4E0D6]">
@@ -1297,6 +1472,9 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
                         </td>
                         <td className="px-2.5 py-1.5 text-[#5E6660] truncate max-w-[140px]">
                           {lead.callNotes || '—'}
+                        </td>
+                        <td className="px-2.5 py-1.5 text-[#1F2421] font-semibold whitespace-nowrap">
+                          {lead.stageId} › {lead.vaStatus}
                         </td>
                       </tr>
                     ))}
@@ -1387,7 +1565,9 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
                 records into{' '}
                 <strong className="text-[#B85338]">
                   {destination === 'deal_pipeline'
-                    ? `Deal Pipeline (${pipelineStage} › ${pipelineStatus})`
+                    ? foundStatuses.length > 0
+                    ? `Deal Pipeline (status from your file; default ${pipelineStage} › ${pipelineStatus})`
+                    : `Deal Pipeline (${pipelineStage} › ${pipelineStatus})`
                     : destination === 'new_campaign'
                     ? newCampaignName || 'New Campaign'
                     : selectedCampaign}

@@ -16,23 +16,75 @@ import {
   User,
   MapPin,
   ExternalLink,
+  Plus,
 } from 'lucide-react';
 import { VABadge } from './VABadge';
 import { DialLink } from './DialLink';
 
 interface TasksTableViewProps {
   tasks: CRMTask[];
+  /** All leads — every task is a view onto one of these (Project Mgmt or Follow-Up). */
+  leads?: Lead[];
   onRefreshTasks: () => void;
+  /** Every edit made on the board is written back onto the source lead (its own group/stage). */
   onUpdateTask: (task: CRMTask, updatedFields: Partial<CRMTask>) => void;
+  onEditLead?: (leadId: string, patch: Partial<Lead>) => void;
+  onChangeStatus?: (leadId: string, newStatus: string) => void;
   onCompleteTask: (taskId: string) => void;
   onOpenLeadDetail: (lead: Lead) => void;
   onLaunchDialer: (leadId: string, phoneNumber?: string, openedWithDial?: boolean) => void;
 }
 
+const STATUS_GROUPS: { label: string; options: { value: string; text: string }[] }[] = [
+  {
+    label: 'Project Mgmt (Active Acquisitions)',
+    options: [
+      { value: 'Interested', text: 'Interested' },
+      { value: 'Interested - Has Asking Price', text: 'Interested - Has Asking Price' },
+      { value: 'For Comps', text: 'For Comps' },
+      { value: 'For Offer', text: 'For Offer' },
+      { value: 'Offer Made', text: 'Offer Made' },
+      { value: 'Negotiating', text: 'Negotiating' },
+      { value: 'Asking too High', text: 'Asking too High (+20 days)' },
+      { value: 'Callback - Tomorrow', text: 'Callback - Tomorrow' },
+      { value: 'Comps Needed', text: 'Comps Needed (+1 day)' },
+      { value: 'Appointment In person', text: 'Appointment In person' },
+      { value: 'Accepted Offer', text: 'Accepted Offer' },
+      { value: 'Contract Sent', text: 'Contract Sent' },
+      { value: 'Deal Won', text: 'Deal Won' },
+    ],
+  },
+  {
+    label: 'Follow-Up (Nurture Timers)',
+    options: [
+      { value: 'Listed', text: 'Listed on MLS (+30 days)' },
+      { value: 'Not Interested - 30 Days', text: 'Not Interested - 30 Days' },
+      { value: 'Not Interested - 60 Days', text: 'Not Interested - 60 Days' },
+      { value: 'Not Interested - 90 Days', text: 'Not Interested - 90 Days' },
+      { value: 'Not Ready to Sell - 30 Days', text: 'Not Ready to Sell - 30 Days' },
+      { value: 'Not Ready to Sell - 60 Days', text: 'Not Ready to Sell - 60 Days' },
+      { value: 'Not Ready to Sell - 90 Days', text: 'Not Ready to Sell - 90 Days' },
+    ],
+  },
+  {
+    label: 'Routing Exceptions',
+    options: [
+      { value: 'Spanish Speaker', text: 'Spanish Speaker (Language Barrier)' },
+      { value: 'Language Barrier', text: 'Language Barrier' },
+      { value: 'DNC', text: 'DNC (Do Not Call)' },
+      { value: 'Sold Already', text: 'Sold Already' },
+      { value: 'Ugly Property', text: 'Ugly Property' },
+    ],
+  },
+];
+const ALL_STATUS_VALUES = STATUS_GROUPS.flatMap((g) => g.options.map((o) => o.value));
+
 export function TasksTableView({
   tasks,
+  leads,
   onRefreshTasks,
   onUpdateTask,
+  onChangeStatus,
   onCompleteTask,
   onOpenLeadDetail,
   onLaunchDialer,
@@ -41,6 +93,24 @@ export function TasksTableView({
   const [typeFilter, setTypeFilter] = useState<string>('all');
   const [tabFilter, setTabFilter] = useState<string>('all');
   const [searchFilter, setSearchFilter] = useState<string>('');
+  // Text typed into a task's "add note" box but not yet saved onto its lead.
+  const [noteDrafts, setNoteDrafts] = useState<Record<string, string>>({});
+
+  const commitNote = (task: CRMTask) => {
+    const text = (noteDrafts[task.id] || '').trim();
+    if (!text) return;
+    setNoteDrafts((prev) => {
+      const { [task.id]: _done, ...rest } = prev;
+      return rest;
+    });
+    onUpdateTask(task, { taskNotes: text }); // appended (date-stamped) onto the source lead
+  };
+
+  // Newest entry of the lead's note trail (entries are separated by a blank line).
+  const latestNote = (notes: string) => {
+    const parts = (notes || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : '';
+  };
 
   const filteredTasks = tasks.filter((t) => {
     const completedBy = t.taskAssignedTo || t.assignedVA || 'Rain';
@@ -225,7 +295,11 @@ export function TasksTableView({
                     {/* Owner & Address */}
                     <td className="py-3.5 px-4">
                       <div
-                        onClick={() => onOpenLeadDetail({ id: task.leadId } as Lead)}
+                        onClick={() =>
+                          onOpenLeadDetail(
+                            leads?.find((l) => l.id === task.leadId) ?? ({ id: task.leadId } as Lead)
+                          )
+                        }
                         className="cursor-pointer group"
                       >
                         <div className="font-bold text-[#1F2421] group-hover:text-[#B85338] flex items-center gap-1.5">
@@ -244,9 +318,36 @@ export function TasksTableView({
                       <span className="inline-block font-semibold px-2 py-0.5 rounded text-[10px] bg-stone-100 text-stone-700 border border-stone-200 mb-1">
                         {task.taskType}
                       </span>
-                      <p className="text-[11px] text-[#1F2421] line-clamp-2 leading-relaxed">
-                        {task.taskNotes || task.notes || 'No task notes'}
+                      <p
+                        className="text-[11px] text-[#1F2421] line-clamp-2 leading-relaxed"
+                        title={task.notes || undefined}
+                      >
+                        {latestNote(task.notes) || 'No task notes'}
                       </p>
+                      <div className="flex items-center gap-1 mt-1.5">
+                        <input
+                          type="text"
+                          value={noteDrafts[task.id] || ''}
+                          onChange={(e) =>
+                            setNoteDrafts((prev) => ({ ...prev, [task.id]: e.target.value }))
+                          }
+                          onBlur={() => commitNote(task)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') commitNote(task);
+                          }}
+                          placeholder="Add note (saves to lead)…"
+                          className="flex-1 min-w-0 text-[11px] bg-[#F8F6F1] border border-[#E4E0D6] rounded px-2 py-1 outline-none focus:border-[#B85338]"
+                        />
+                        <button
+                          type="button"
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => commitNote(task)}
+                          className="p-1 rounded bg-[#4A7A5E] hover:bg-[#3E654E] text-white cursor-pointer"
+                          title="Save note onto the lead"
+                        >
+                          <Plus className="w-3 h-3" />
+                        </button>
+                      </div>
                     </td>
 
                     {/* Assigned VA */}
@@ -269,8 +370,18 @@ export function TasksTableView({
                     {/* Next Due Date */}
                     <td className="py-3.5 px-4 font-mono font-medium text-[11px] text-[#1F2421]">
                       <div className="flex items-center gap-1.5">
-                        <Calendar className="w-3.5 h-3.5 text-[#5E6660]" />
-                        <span>{task.nextTaskDate || 'No date set'}</span>
+                        <Calendar className="w-3.5 h-3.5 text-[#5E6660] shrink-0" />
+                        <input
+                          type="date"
+                          value={task.nextTaskDate || ''}
+                          onChange={(e) => {
+                            if (e.target.value) onUpdateTask(task, { nextTaskDate: e.target.value });
+                          }}
+                          className="bg-[#F8F6F1] border border-[#E4E0D6] rounded px-1.5 py-1 text-[11px] font-mono text-[#1F2421] outline-none cursor-pointer"
+                          title={`Saved to the ${task.sourceTabName} lead's ${
+                            task.sourceTabName === 'Project Mgmt' ? 'callback' : 'follow-up'
+                          } date`}
+                        />
                       </div>
                     </td>
 
@@ -299,10 +410,29 @@ export function TasksTableView({
 
                     {/* Status / Source */}
                     <td className="py-3.5 px-4">
-                      <div className="font-semibold text-[11px] text-[#1F2421]">
-                        {task.status || 'Active'}
-                      </div>
-                      <span className="text-[10px] text-[#5E6660]">
+                      <select
+                        value={task.status || ''}
+                        onChange={(e) => {
+                          if (onChangeStatus) onChangeStatus(task.leadId, e.target.value);
+                          else onUpdateTask(task, { status: e.target.value });
+                        }}
+                        className="max-w-[170px] bg-[#F8F6F1] hover:bg-white border border-[#E4E0D6] rounded px-2 py-1 text-[11px] font-semibold text-[#1F2421] outline-none cursor-pointer"
+                        title="Changes the lead's status (auto-routes stage & dates, same as the lead drawer)"
+                      >
+                        {task.status && !ALL_STATUS_VALUES.includes(task.status) && (
+                          <option value={task.status}>{task.status}</option>
+                        )}
+                        {STATUS_GROUPS.map((g) => (
+                          <optgroup key={g.label} label={g.label}>
+                            {g.options.map((o) => (
+                              <option key={o.value} value={o.value}>
+                                {o.text}
+                              </option>
+                            ))}
+                          </optgroup>
+                        ))}
+                      </select>
+                      <span className="block mt-0.5 text-[10px] text-[#5E6660]">
                         {task.sourceTabName}
                       </span>
                     </td>

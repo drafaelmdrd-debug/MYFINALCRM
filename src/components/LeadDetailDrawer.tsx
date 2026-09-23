@@ -266,6 +266,17 @@ export const LeadDetailDrawer: React.FC<LeadDetailDrawerProps> = ({
     onUpdateLead(updatedLead);
   };
 
+  // Auto-save the offer amounts when a box loses focus (so typed values are never lost
+  // if the drawer is closed or the page refreshed before "Save Amounts" is clicked).
+  const handleAutoSaveFinancials = () => {
+    const changed =
+      askingPrice !== (lead.askingPrice || '') ||
+      startingOffer !== (lead.startingOffer || '') ||
+      maxOffer !== (lead.maxOffer || '') ||
+      counterOffer !== (lead.counterOffer || '');
+    if (changed) handleSaveFinancials();
+  };
+
   const handleSaveMailingAddress = () => {
     const trimmed = mailingAddress.trim();
     onUpdateLead({
@@ -1085,6 +1096,7 @@ export const LeadDetailDrawer: React.FC<LeadDetailDrawerProps> = ({
                     type="text"
                     value={askingPrice}
                     onChange={(e) => setAskingPrice(e.target.value)}
+                    onBlur={handleAutoSaveFinancials}
                     placeholder="$175,000"
                     className="w-full bg-[#F8F6F1] border border-[#E4E0D6] rounded px-2.5 py-1.5 text-xs font-semibold text-[#1F2421] outline-none"
                   />
@@ -1098,6 +1110,7 @@ export const LeadDetailDrawer: React.FC<LeadDetailDrawerProps> = ({
                     type="text"
                     value={startingOffer}
                     onChange={(e) => setStartingOffer(e.target.value)}
+                    onBlur={handleAutoSaveFinancials}
                     placeholder="$120,000"
                     className="w-full bg-[#F8F6F1] border border-[#E4E0D6] rounded px-2.5 py-1.5 text-xs font-semibold text-[#1F2421] outline-none"
                   />
@@ -1111,6 +1124,7 @@ export const LeadDetailDrawer: React.FC<LeadDetailDrawerProps> = ({
                     type="text"
                     value={maxOffer}
                     onChange={(e) => setMaxOffer(e.target.value)}
+                    onBlur={handleAutoSaveFinancials}
                     placeholder="$145,000"
                     className="w-full bg-[#F8F6F1] border border-[#E4E0D6] rounded px-2.5 py-1.5 text-xs font-semibold text-[#1F2421] outline-none"
                   />
@@ -1124,6 +1138,7 @@ export const LeadDetailDrawer: React.FC<LeadDetailDrawerProps> = ({
                     type="text"
                     value={counterOffer}
                     onChange={(e) => setCounterOffer(e.target.value)}
+                    onBlur={handleAutoSaveFinancials}
                     placeholder="$155,000"
                     className="w-full bg-[#F8F6F1] border border-[#E4E0D6] rounded px-2.5 py-1.5 text-xs font-semibold text-[#1F2421] outline-none"
                   />
