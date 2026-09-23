@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { Lead, VA, StageId, SourceTabId, ContactPerson, PhoneNumberRecord } from '../types';
 import { routeLead, isFollowupStatus } from '../logic/moveEngine';
+import { planImport, PhoneAdd, ImportPlan } from '../logic/duplicates';
 
 export type ImportDestination = 'existing_campaign' | 'new_campaign' | 'deal_pipeline' | 'needs_skiptracing';
 
@@ -28,7 +29,10 @@ interface BulkImportModalProps {
   onClose: () => void;
   campaigns: string[];
   onAddNewCampaign?: (name: string) => void;
-  onImportLeads: (leads: Lead[]) => void;
+  /** Leads already in the CRM — used to spot addresses / phone numbers that are already there. */
+  existingLeads?: Lead[];
+  /** `phoneAdds` = numbers to add to leads that already exist (their address matched). */
+  onImportLeads: (leads: Lead[], phoneAdds?: PhoneAdd[]) => void;
   defaultDestination?: ImportDestination;
 }
 
@@ -318,6 +322,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
   campaigns,
   onAddNewCampaign,
   onImportLeads,
+  existingLeads,
   defaultDestination,
 }) => {
   if (!isOpen) return null;
@@ -343,6 +348,8 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
   const [customMappings, setCustomMappings] = useState<Record<number, StandardField>>({});
   // Stage/status mapping for Deal Pipeline imports: text found in the file -> CRM status
   // ('' = use the default status chosen above). Anything not listed here is auto-detected.
+  // Skip rows whose address is already in the CRM (only their new phone numbers are added)
+  const [dedupeEnabled, setDedupeEnabled] = useState<boolean>(true);
   const [statusOverrides, setStatusOverrides] = useState<Record<string, string>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -853,6 +860,22 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
     return leads;
   }, [parsedSheet, activeMappings, destination, selectedCampaign, newCampaignName, pipelineStage, pipelineStatus, assignedVA, statusOverrides]);
 
+  // 4. Duplicate check: same address already in the CRM (or earlier in this file) -> don't
+  //    create a second lead, just add the phone numbers that aren't on it yet.
+  const plan = useMemo<ImportPlan>(() => {
+    if (!dedupeEnabled) {
+      return {
+        newLeads: parsedLeads,
+        phoneAdds: [],
+        matches: [],
+        stats: { rows: parsedLeads.length, newLeads: parsedLeads.length, matchedExisting: 0, mergedInFile: 0, numbersAdded: 0, numbersSkipped: 0 },
+      };
+    }
+    return planImport(parsedLeads, existingLeads || []);
+  }, [parsedLeads, existingLeads, dedupeEnabled]);
+  const hasDuplicateActivity =
+    plan.stats.matchedExisting > 0 || plan.stats.mergedInFile > 0 || plan.stats.numbersSkipped > 0;
+
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -918,7 +941,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
       }
     }
 
-    onImportLeads(parsedLeads);
+    onImportLeads(plan.newLeads, plan.phoneAdds);
     onClose();
   };
 
@@ -1402,15 +1425,98 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
         )}
 
         {/* Live Preview Table - Accurately matches parsed leads and multiple owners/offers */}
+        {/* Duplicate check summary */}
+        {parsedLeads.length > 0 && (
+          <div className="border border-[#E4E0D6] rounded-lg overflow-hidden bg-white">
+            <div className="p-2.5 bg-[#F8F6F1] flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <FileSearch className="w-4 h-4 text-[#B85338]" />
+                <span className="text-xs font-bold text-[#1F2421]">Duplicate Check</span>
+                <span className="text-[11px] text-[#5E6660]">
+                  Same address = same lead. Numbers already on it are ignored; only new numbers are added.
+                </span>
+              </div>
+              <label className="flex items-center gap-1.5 text-[11px] font-semibold text-[#1F2421] cursor-pointer shrink-0">
+                <input
+                  type="checkbox"
+                  checked={dedupeEnabled}
+                  onChange={(e) => setDedupeEnabled(e.target.checked)}
+                  className="accent-[#B85338]"
+                />
+                <span>Check duplicates</span>
+              </label>
+            </div>
+            {dedupeEnabled && (
+              <div className="p-3 border-t border-[#E4E0D6] space-y-2 text-xs">
+                <div className="flex flex-wrap gap-x-5 gap-y-1 text-[#5E6660]">
+                  <span>
+                    <strong className="text-[#1F2421]">{plan.stats.newLeads}</strong> new lead
+                    {plan.stats.newLeads === 1 ? '' : 's'}
+                  </span>
+                  <span>
+                    <strong className="text-[#1F2421]">{plan.stats.matchedExisting}</strong> row
+                    {plan.stats.matchedExisting === 1 ? '' : 's'} already in the CRM
+                  </span>
+                  {plan.stats.mergedInFile > 0 && (
+                    <span>
+                      <strong className="text-[#1F2421]">{plan.stats.mergedInFile}</strong> repeated in your file
+                    </span>
+                  )}
+                  <span>
+                    <strong className="text-[#4A7A5E]">{plan.stats.numbersAdded}</strong> new number
+                    {plan.stats.numbersAdded === 1 ? '' : 's'} to add
+                  </span>
+                  <span>
+                    <strong className="text-amber-700">{plan.stats.numbersSkipped}</strong> duplicate number
+                    {plan.stats.numbersSkipped === 1 ? '' : 's'} ignored
+                  </span>
+                </div>
+                {plan.matches.length > 0 && (
+                  <div className="max-h-32 overflow-y-auto space-y-1">
+                    {plan.matches.slice(0, 50).map((m) => (
+                      <div
+                        key={m.leadId}
+                        className="flex items-start justify-between gap-3 p-1.5 rounded bg-[#FDFBF7] border border-[#E4E0D6]"
+                      >
+                        <div className="min-w-0">
+                          <div className="font-bold text-[#1F2421] truncate">
+                            {m.address} <span className="font-normal text-[#5E6660]">· {m.ownerName} · {m.stage}</span>
+                          </div>
+                        </div>
+                        <div className="shrink-0 text-[11px] font-mono text-right">
+                          {m.added.length > 0 && (
+                            <span className="text-[#4A7A5E] font-bold">+ {m.added.join(', ')}</span>
+                          )}
+                          {m.added.length === 0 && (
+                            <span className="text-[#5E6660]">nothing new to add</span>
+                          )}
+                          {m.skipped.length > 0 && (
+                            <span className="ml-2 text-amber-700">already has {m.skipped.length}</span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {!hasDuplicateActivity && (
+                  <div className="text-[11px] text-[#4A7A5E] font-semibold">
+                    No duplicates found — every row is a new address.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
         {parsedLeads.length > 0 && (
           <div className="space-y-1.5">
             <div className="flex items-center justify-between text-[11px] font-bold text-[#5E6660] uppercase">
               <span className="flex items-center gap-1.5 text-[#1F2421]">
                 <CheckCircle2 className="w-3.5 h-3.5 text-[#4A7A5E]" />
-                <span>Preview Parsed Records ({parsedLeads.length} Ready to Import)</span>
+                <span>Preview Parsed Records ({plan.newLeads.length} New Lead{plan.newLeads.length === 1 ? '' : 's'} Ready to Import)</span>
               </span>
               <span className="text-[#4A7A5E] font-semibold lowercase">
-                Showing preview of first {Math.min(parsedLeads.length, 4)} records
+                Showing preview of first {Math.min(plan.newLeads.length, 4)} records
               </span>
             </div>
 
@@ -1434,7 +1540,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#E4E0D6]">
-                    {parsedLeads.slice(0, 4).map((lead, i) => (
+                    {plan.newLeads.slice(0, 4).map((lead, i) => (
                       <tr key={lead.id || i} className="hover:bg-[#FDFBF7]">
                         <td className="px-2.5 py-1.5 font-bold text-[#1F2421] truncate max-w-[120px]">
                           {lead.ownerName || '—'}
@@ -1495,7 +1601,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#E4E0D6]">
-                    {parsedLeads.slice(0, 4).map((lead, i) => (
+                    {plan.newLeads.slice(0, 4).map((lead, i) => (
                       <tr key={lead.id || i} className="hover:bg-[#FDFBF7]">
                         <td className="px-2.5 py-1.5 font-bold text-[#1F2421] truncate max-w-[120px]">
                           {lead.ownerName || '—'}
@@ -1561,8 +1667,8 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
           <div className="text-xs text-[#5E6660]">
             {parsedLeads.length > 0 ? (
               <span>
-                Ready to import <strong className="text-[#1F2421]">{parsedLeads.length}</strong>{' '}
-                records into{' '}
+                Ready to import <strong className="text-[#1F2421]">{plan.newLeads.length}</strong>{' '}
+                new records into{' '}
                 <strong className="text-[#B85338]">
                   {destination === 'deal_pipeline'
                     ? foundStatuses.length > 0
@@ -1572,6 +1678,15 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
                     ? newCampaignName || 'New Campaign'
                     : selectedCampaign}
                 </strong>
+                {plan.phoneAdds.length > 0 && (
+                  <span>
+                    {' '}
+                    and add <strong className="text-[#4A7A5E]">{plan.stats.numbersAdded}</strong> new number
+                    {plan.stats.numbersAdded === 1 ? '' : 's'} to{' '}
+                    <strong className="text-[#4A7A5E]">{plan.phoneAdds.length}</strong> existing lead
+                    {plan.phoneAdds.length === 1 ? '' : 's'}
+                  </span>
+                )}
               </span>
             ) : (
               <span>No records loaded yet</span>
@@ -1588,12 +1703,18 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
             </button>
             <button
               type="button"
-              disabled={parsedLeads.length === 0}
+              disabled={plan.newLeads.length === 0 && plan.phoneAdds.length === 0}
               onClick={handleConfirmImport}
               className="px-4 py-2 rounded-lg bg-[#B85338] hover:bg-[#A3432B] disabled:opacity-50 text-white text-xs font-bold shadow-sm transition-colors cursor-pointer flex items-center gap-1.5"
             >
               <CheckCircle2 className="w-4 h-4" />
-              <span>Import {parsedLeads.length} Leads</span>
+              <span>
+                {plan.newLeads.length > 0 || plan.phoneAdds.length === 0
+                  ? `Import ${plan.newLeads.length} Lead${plan.newLeads.length === 1 ? '' : 's'}${
+                      plan.phoneAdds.length > 0 ? ` + ${plan.stats.numbersAdded} Number${plan.stats.numbersAdded === 1 ? '' : 's'}` : ''
+                    }`
+                  : `Add ${plan.stats.numbersAdded} New Number${plan.stats.numbersAdded === 1 ? '' : 's'}`}
+              </span>
             </button>
           </div>
         </div>
