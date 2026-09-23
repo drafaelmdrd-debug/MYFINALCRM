@@ -1,6 +1,6 @@
 import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { supabase } from './supabase';
-import { reportError, reportOk } from './cloudSync';
+import { reportError, reportOk, hasPendingCloudWrites } from './cloudSync';
 import { LeadSyncEngine } from './leadSync';
 
 /**
@@ -27,6 +27,20 @@ export function useCloudLeads<T extends { id: string }>(initialValue: T[], enabl
     if (!enabled) return;
     engine.start();
     return () => engine.stop();
+  }, [enabled, engine]);
+
+  // If someone refreshes/closes the tab while an edit is still on its way to the
+  // database, make the browser ask first instead of silently losing it.
+  useEffect(() => {
+    if (!enabled) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (engine.hasUnsavedChanges() || hasPendingCloudWrites()) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
   }, [enabled, engine]);
 
   return [snap.items, engine.set, snap.loaded] as const;

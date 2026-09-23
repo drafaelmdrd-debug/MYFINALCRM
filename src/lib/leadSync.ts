@@ -163,6 +163,24 @@ export class LeadSyncEngine<T extends { id: string }> {
     this.requestFlush();
   };
 
+  /**
+   * True while any lead edit has not yet been confirmed saved in the database.
+   * Used to warn before the page is refreshed or closed.
+   */
+  hasUnsavedChanges = (): boolean => {
+    if (!this.active || !this.loaded) return false;
+    if (this.running || this.again || this.retryTimer) return true;
+    const seen = new Set<string>();
+    for (const lead of this.items) {
+      if (seen.has(lead.id)) continue;
+      seen.add(lead.id);
+      const s = this.synced.get(lead.id);
+      if (!s || s.json !== this.canon(lead)) return true;
+    }
+    for (const id of this.synced.keys()) if (!seen.has(id)) return true;
+    return false;
+  };
+
   private publish() {
     this.snapshot = { items: this.items, loaded: this.loaded };
     this.listeners.forEach((l) => l());

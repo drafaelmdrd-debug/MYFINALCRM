@@ -18,6 +18,16 @@ export function reportOk(key: string) {
   window.dispatchEvent(new CustomEvent(CLOUD_SYNC_OK_EVENT, { detail: { key } }));
 }
 
+/** Keys that have local edits not yet confirmed saved in Supabase. */
+const pendingKeys = new Set<string>();
+
+/** True while any `useCloudState` value still has an unsaved edit (used to warn before a refresh/close). */
+export function hasPendingCloudWrites(): boolean {
+  return pendingKeys.size > 0;
+}
+
+const SAVE_RETRY_MS = 5000;
+
 /**
  * Drop-in replacement for `useState` + localStorage, backed by the shared
  * Supabase `crm_state` table.
@@ -35,6 +45,9 @@ export function useCloudState<T>(key: string, initialValue: T, enabled: boolean)
   const lastSyncedJson = useRef<string | null>(null);
   const loadedRef = useRef(false);
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const latestState = useRef<T>(initialValue);
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  latestState.current = state;
 
   // Initial load from Supabase
   useEffect(() => {
@@ -103,28 +116,55 @@ export function useCloudState<T>(key: string, initialValue: T, enabled: boolean)
     };
   }, [enabled, key]);
 
-  // Push local changes up to Supabase
-  useEffect(() => {
-    if (!enabled || !loadedRef.current) return;
-
-    const json = JSON.stringify(state);
-    if (json === lastSyncedJson.current) return; // nothing new to save
-
-    const valueToSave = state;
-    // Serialize saves so they always land in order.
+  // Push local changes up to Supabase.
+  // Every queued save writes the LATEST value (so bursts of edits collapse into as few
+  // writes as possible), saves land strictly in order, and a failed save is retried
+  // automatically instead of waiting for the next edit — an edit is never silently dropped.
+  const saveLatest = () => {
     saveQueue.current = saveQueue.current.then(async () => {
-      const { error } = await supabase
-        .from(TABLE)
-        .upsert({ id: key, value: valueToSave as unknown as object, updated_at: new Date().toISOString() });
-      if (error) {
-        reportError(key, 'save', error.message);
-      } else {
+      const valueToSave = latestState.current;
+      const json = JSON.stringify(valueToSave);
+      if (json === lastSyncedJson.current) {
+        pendingKeys.delete(key);
+        return;
+      }
+      try {
+        const { error } = await supabase
+          .from(TABLE)
+          .upsert({ id: key, value: valueToSave as unknown as object, updated_at: new Date().toISOString() });
+        if (error) throw new Error(error.message);
         lastSyncedJson.current = json;
+        if (JSON.stringify(latestState.current) === json) pendingKeys.delete(key);
         reportOk(key);
+      } catch (e) {
+        pendingKeys.add(key);
+        reportError(key, 'save', e instanceof Error ? e.message : String(e));
+        if (!retryTimer.current) {
+          retryTimer.current = setTimeout(() => {
+            retryTimer.current = null;
+            saveLatest();
+          }, SAVE_RETRY_MS);
+        }
       }
     });
+  };
+
+  useEffect(() => {
+    if (!enabled || !loadedRef.current) return;
+    if (JSON.stringify(state) === lastSyncedJson.current) return; // nothing new to save
+    pendingKeys.add(key);
+    saveLatest();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state, enabled, loaded]);
+
+  useEffect(
+    () => () => {
+      if (retryTimer.current) clearTimeout(retryTimer.current);
+      pendingKeys.delete(key);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [key]
+  );
 
   return [state, setState, loaded] as const;
 }
