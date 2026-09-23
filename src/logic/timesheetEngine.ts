@@ -6,6 +6,7 @@ import {
   DayWorkSummary,
   TimesheetPayPeriodSummary,
 } from '../types';
+import { dallasDateKey, addDaysToDateKey, dallasEndOfDay } from '../utils/dallasTime';
 
 export const DEFAULT_SHIFT = {
   scheduledIn: '08:00', // 8:00 AM
@@ -249,7 +250,7 @@ export function calculateDaySummary(
         workingMs += lastPunchTime - currentWorkStart;
       } else {
         // Standard shift cap: 8 hours or end of day
-        const endOfDay = new Date(dateStr + 'T23:59:59').getTime();
+        const endOfDay = dallasEndOfDay(dateStr).getTime(); // 11:59:59 PM Dallas time
         const standardShiftMs = 8 * 60 * 60 * 1000;
         const autoEndTime = Math.min(endOfDay, currentWorkStart + standardShiftMs);
         workingMs += Math.max(0, autoEndTime - currentWorkStart);
@@ -288,19 +289,17 @@ export function calculatePayPeriodSummary(
   // Filter for this VA
   const vaPunches = allPunches.filter((p) => p.va === va);
 
-  const today = new Date();
-  const todayDateStr = today.toISOString().split('T')[0];
+  const todayDateStr = dallasDateKey(); // Dallas calendar day
 
   let dates: string[] = [];
 
   if (customStartDate && customEndDate) {
-    const startObj = new Date(customStartDate + 'T12:00:00');
-    const endObj = new Date(customEndDate + 'T12:00:00');
+    const startObj = new Date(customStartDate + 'T12:00:00Z');
+    const endObj = new Date(customEndDate + 'T12:00:00Z');
     if (!isNaN(startObj.getTime()) && !isNaN(endObj.getTime()) && startObj <= endObj) {
-      const cur = new Date(startObj);
-      while (cur <= endObj) {
-        dates.push(cur.toISOString().split('T')[0]);
-        cur.setDate(cur.getDate() + 1);
+      for (let cur = customStartDate; cur <= customEndDate; cur = addDaysToDateKey(cur, 1)) {
+        dates.push(cur);
+        if (dates.length > 400) break; // safety net against a typo'd range
       }
     }
   }
@@ -308,9 +307,7 @@ export function calculatePayPeriodSummary(
   // Fallback to periodDays up to today
   if (dates.length === 0) {
     for (let i = periodDays - 1; i >= 0; i--) {
-      const d = new Date();
-      d.setDate(today.getDate() - i);
-      dates.push(d.toISOString().split('T')[0]);
+      dates.push(addDaysToDateKey(todayDateStr, -i));
     }
   }
 

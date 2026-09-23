@@ -1,4 +1,5 @@
 import { Lead, CRMTask, StageId, TaskType, VA } from '../types';
+import { dallasDateKey, dallasDateMMDDYY, dallasDateKeyOffset } from '../utils/dallasTime';
 
 export function isProjectStatus(status: string): boolean {
   const s = (status || '').trim();
@@ -165,39 +166,28 @@ export function isLeadInDealPipeline(lead: Lead): boolean {
   return false;
 }
 
+// All CRM dates are Dallas, Texas dates (America/Chicago), whatever the user's computer says.
 export function formatDateToMMDDYY(d: Date): string {
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  const yy = String(d.getFullYear()).slice(-2);
-  return `${mm}/${dd}/${yy}`;
+  return dallasDateMMDDYY(d);
 }
 
 export function formatDateToYYYYMMDD(d: Date): string {
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
+  return dallasDateKey(d);
 }
 
 export function calculateAutomatedDate(status: string): string | undefined {
   const clean = (status || '').trim();
   const lower = clean.toLowerCase();
-  const today = new Date();
-
   // Rule 1: "Listed" -> +30 days
   if (lower === 'listed') {
-    const future = new Date(today);
-    future.setDate(today.getDate() + 30);
-    return formatDateToYYYYMMDD(future);
+    return dallasDateKeyOffset(30);
   }
 
   // Rule 2: 30 / 60 / 90 days
   const daysMatch = clean.match(/\b(30|60|90)\b/);
   if (daysMatch) {
     const days = parseInt(daysMatch[1], 10);
-    const future = new Date(today);
-    future.setDate(today.getDate() + days);
-    return formatDateToYYYYMMDD(future);
+    return dallasDateKeyOffset(days);
   }
 
   // Rule 3: Callback Tomorrow, Comps Needed, For Comps, For Offer -> tomorrow
@@ -209,16 +199,12 @@ export function calculateAutomatedDate(status: string): string | undefined {
     lower === 'for comps' ||
     lower === 'for offer'
   ) {
-    const tomorrow = new Date(today);
-    tomorrow.setDate(today.getDate() + 1);
-    return formatDateToYYYYMMDD(tomorrow);
+    return dallasDateKeyOffset(1);
   }
 
   // Rule 4: Asking too High -> +20 days
   if (lower === 'asking too high') {
-    const in20 = new Date(today);
-    in20.setDate(today.getDate() + 20);
-    return formatDateToYYYYMMDD(in20);
+    return dallasDateKeyOffset(20);
   }
 
   // Rule 5: Not Interested / Not Ready / Follow-Up -> default +30 days if not otherwise specified
@@ -227,9 +213,7 @@ export function calculateAutomatedDate(status: string): string | undefined {
     lower.includes('not ready') ||
     lower.startsWith('follow')
   ) {
-    const in30 = new Date(today);
-    in30.setDate(today.getDate() + 30);
-    return formatDateToYYYYMMDD(in30);
+    return dallasDateKeyOffset(30);
   }
 
   return undefined;
@@ -380,9 +364,7 @@ export function routeLead(
     if (calculatedFutureDate) {
       updated.followUpDate = calculatedFutureDate;
     } else if (!updated.followUpDate) {
-      const in30 = new Date();
-      in30.setDate(in30.getDate() + 30);
-      updated.followUpDate = formatDateToYYYYMMDD(in30);
+      updated.followUpDate = dallasDateKeyOffset(30);
     }
 
     if (currentStage !== 'Follow-Up') {
