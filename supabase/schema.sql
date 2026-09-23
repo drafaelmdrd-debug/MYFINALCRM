@@ -110,6 +110,115 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- 3b. Field-level saves for existing leads.
+--     The app sends only WHAT CHANGED on a lead (set/remove fields, text to append to
+--     notes, phone/contact records to add/remove/change by id). This function applies
+--     that on top of the row's CURRENT value while holding a row lock, so two people
+--     editing different parts of the same lead at the same moment both keep their edits.
+--     If the lead was deleted meanwhile, it is re-created from the full copy.
+--     Safe to run more than once. Without it the app still works, but falls back to
+--     saving whole leads (last save wins).
+-- ---------------------------------------------------------------------------
+create or replace function public.crm_patch_leads(items jsonb)
+returns table (lead_id text, lead_value jsonb, lead_sort_key double precision, lead_version bigint)
+language plpgsql
+as $$
+declare
+  it jsonb;
+  cur public.crm_leads%rowtype;
+  v jsonb;
+  k text;
+  op jsonb;
+  arr jsonb;
+  suffix text;
+  patch jsonb;
+begin
+  for it in select e.value from jsonb_array_elements(items) as e loop
+    patch := coalesce(it->'patch', '{}'::jsonb);
+
+    select * into cur from public.crm_leads l where l.id = it->>'id' for update;
+
+    if not found then
+      insert into public.crm_leads (id, value, sort_key, writer)
+      values (
+        it->>'id',
+        it->'full',
+        coalesce((it->>'sort_key')::double precision, 0),
+        it->>'writer'
+      )
+      returning * into cur;
+    else
+      v := cur.value;
+
+      -- fields removed
+      for k in select jsonb_array_elements_text(coalesce(patch->'remove', '[]'::jsonb)) loop
+        v := v - k;
+      end loop;
+
+      -- fields overwritten
+      v := v || coalesce(patch->'set', '{}'::jsonb);
+
+      -- text appended (notes); skipped if it is already the tail (a retried write)
+      for k in select jsonb_object_keys(coalesce(patch->'append', '{}'::jsonb)) loop
+        suffix := patch->'append'->>k;
+        if right(coalesce(v->>k, ''), length(suffix)) is distinct from suffix then
+          v := jsonb_set(v, array[k], to_jsonb(coalesce(v->>k, '') || suffix), true);
+        end if;
+      end loop;
+
+      -- records with an id (phone numbers, contacts): remove, change, then add
+      for k in select jsonb_object_keys(coalesce(patch->'arrays', '{}'::jsonb)) loop
+        op := patch->'arrays'->k;
+        arr := case when jsonb_typeof(v->k) = 'array' then v->k else '[]'::jsonb end;
+
+        arr := coalesce((
+          select jsonb_agg(t.e order by t.ord)
+          from jsonb_array_elements(arr) with ordinality as t(e, ord)
+          where not coalesce(
+            (t.e->>'id') = any (array(select jsonb_array_elements_text(coalesce(op->'removed', '[]'::jsonb)))),
+            false)
+        ), '[]'::jsonb);
+
+        arr := coalesce((
+          select jsonb_agg(
+                   coalesce(
+                     (select c from jsonb_array_elements(coalesce(op->'changed', '[]'::jsonb)) as c
+                       where c->>'id' = t.e->>'id' limit 1),
+                     t.e)
+                   order by t.ord)
+          from jsonb_array_elements(arr) with ordinality as t(e, ord)
+        ), '[]'::jsonb);
+
+        arr := arr || coalesce((
+          select jsonb_agg(a)
+          from jsonb_array_elements(coalesce(op->'added', '[]'::jsonb)) as a
+          where not exists (select 1 from jsonb_array_elements(arr) as x where x->>'id' = a->>'id')
+        ), '[]'::jsonb);
+
+        v := jsonb_set(v, array[k], arr, true);
+      end loop;
+
+      update public.crm_leads l
+         set value = v,
+             sort_key = coalesce((it->>'sort_key')::double precision, l.sort_key),
+             writer = it->>'writer'
+       where l.id = cur.id
+      returning * into cur;
+    end if;
+
+    lead_id := cur.id;
+    lead_value := cur.value;
+    lead_sort_key := cur.sort_key;
+    lead_version := cur.version;
+    return next;
+  end loop;
+end;
+$$;
+
+revoke all on function public.crm_patch_leads(jsonb) from public, anon;
+grant execute on function public.crm_patch_leads(jsonb) to authenticated;
+
+-- ---------------------------------------------------------------------------
 -- 4. Daily call-results reset — decided by the DATABASE, once per Dallas day.
 --    The first signed-in browser to notice a new Dallas date "claims" the day
 --    (function returns true and resets the counts). Everyone else gets false.
