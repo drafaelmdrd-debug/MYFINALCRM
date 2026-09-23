@@ -18,6 +18,7 @@ import {
   calculateDaySummary,
   getVAPunchStatus,
 } from '../logic/timesheetEngine';
+import { dallasDateKey, formatDallasTime } from '../utils/dallasTime';
 
 interface KPIDashboardViewProps {
   leads: Lead[];
@@ -65,7 +66,7 @@ export const KPIDashboardView: React.FC<KPIDashboardViewProps> = ({
     setIsRefreshingDispo(true);
     setIsRefreshingHours(true);
     onManualRefresh();
-    setLastRecountTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
+    setLastRecountTime(formatDallasTime(new Date(), { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
     setTimeout(() => {
       setIsRefreshingAll(false);
       setIsRefreshingPipeline(false);
@@ -81,7 +82,7 @@ export const KPIDashboardView: React.FC<KPIDashboardViewProps> = ({
     } else {
       onManualRefresh();
     }
-    setLastRecountTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
+    setLastRecountTime(formatDallasTime(new Date(), { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
     setTimeout(() => setIsRefreshingPipeline(false), 500);
   };
 
@@ -296,7 +297,7 @@ export const KPIDashboardView: React.FC<KPIDashboardViewProps> = ({
   ];
 
   // Timesheet data for current day
-  const todayDateStr = new Date().toISOString().split('T')[0];
+  const todayDateStr = dallasDateKey(); // Dallas calendar day
   const teamVAs: VA[] = ['Rain', 'Jah', 'Jen', 'David'];
 
   const handleQuickPunch = (va: VA, action: TimesheetAction) => {
@@ -305,7 +306,7 @@ export const KPIDashboardView: React.FC<KPIDashboardViewProps> = ({
     onAddPunch({
       va,
       action,
-      date: now.toISOString().split('T')[0],
+      date: dallasDateKey(now),
       timestamp: now.toISOString(),
       note: 'Quick punch via KPI Dashboard',
     });

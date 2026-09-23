@@ -29,6 +29,16 @@ import {
   DEFAULT_SHIFT,
 } from '../logic/timesheetEngine';
 import { VABadge } from './VABadge';
+import {
+  dallasDateKey,
+  dallasDateKeyOffset,
+  addDaysToDateKey,
+  dallasWallTimeToDate,
+  dallasHHMM,
+  dallasZoneAbbr,
+  formatDallasTime,
+  formatDallasDate,
+} from '../utils/dallasTime';
 
 interface TimesheetViewProps {
   punches: TimesheetPunch[];
@@ -63,15 +73,8 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
   const [inlineNote, setInlineNote] = useState<string>('');
 
   // Date range state for 14-day table breakdown (defaults to 14 days ending today)
-  const [rangeStart, setRangeStart] = useState<string>(() => {
-    const end = new Date();
-    const start = new Date();
-    start.setDate(end.getDate() - 13);
-    return start.toISOString().split('T')[0];
-  });
-  const [rangeEnd, setRangeEnd] = useState<string>(() => {
-    return new Date().toISOString().split('T')[0];
-  });
+  const [rangeStart, setRangeStart] = useState<string>(() => dallasDateKeyOffset(-13));
+  const [rangeEnd, setRangeEnd] = useState<string>(() => dallasDateKey());
 
   // Live timer tick for real-time second updates
   const [currentTime, setCurrentTime] = useState<Date>(new Date());
@@ -80,7 +83,7 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
     return () => clearInterval(timer);
   }, []);
 
-  const todayStr = currentTime.toISOString().split('T')[0];
+  const todayStr = dallasDateKey(currentTime); // Dallas calendar day
 
   // Pay Period Summary (14 days or user-selected range)
   const payPeriod = calculatePayPeriodSummary(
@@ -109,7 +112,7 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
     onAddPunch({
       va: selectedVA,
       action,
-      date: now.toISOString().split('T')[0],
+      date: dallasDateKey(now),
       timestamp: now.toISOString(),
       note: punchNote.trim() || undefined,
     });
@@ -127,7 +130,8 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
   const handleSaveInlinePunch = () => {
     if (!selectedDateDetail) return;
     const [hours, minutes] = inlineTime.split(':');
-    const punchDate = new Date(`${selectedDateDetail}T${hours || '00'}:${minutes || '00'}:00`);
+    // The time typed in is Dallas time.
+    const punchDate = dallasWallTimeToDate(selectedDateDetail, Number(hours || 0), Number(minutes || 0));
     const newPunch: TimesheetPunch = {
       id: `punch-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
       va: selectedVA,
@@ -152,19 +156,13 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
     
     // Extract times if existing
     if (day.firstLogin) {
-      const dt = new Date(day.firstLogin);
-      const hh = String(dt.getHours()).padStart(2, '0');
-      const mm = String(dt.getMinutes()).padStart(2, '0');
-      setEditFirstLoginTime(`${hh}:${mm}`);
+      setEditFirstLoginTime(dallasHHMM(day.firstLogin));
     } else {
       setEditFirstLoginTime('09:00');
     }
 
     if (day.lastLogout) {
-      const dt = new Date(day.lastLogout);
-      const hh = String(dt.getHours()).padStart(2, '0');
-      const mm = String(dt.getMinutes()).padStart(2, '0');
-      setEditLastLogoutTime(`${hh}:${mm}`);
+      setEditLastLogoutTime(dallasHHMM(day.lastLogout));
     } else {
       setEditLastLogoutTime('17:00');
     }
@@ -187,8 +185,16 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
     const newPunches: TimesheetPunch[] = [];
     const targetDate = editDate || editingDay.date;
 
+    // Every time typed in this dialog is Dallas time; convert to the real instant.
+    const wall = (hhmm: string) => {
+      const [h, m] = hhmm.split(':').map(Number);
+      return dallasWallTimeToDate(targetDate, h || 0, m || 0).toISOString();
+    };
+    const wallMinutes = (totalMinutes: number) =>
+      dallasWallTimeToDate(targetDate, 0, totalMinutes).toISOString();
+
     // First Login
-    const loginTs = `${targetDate}T${editFirstLoginTime}:00.000Z`;
+    const loginTs = wall(editFirstLoginTime);
     newPunches.push({
       id: `punch-edit-login-${Date.now()}-1`,
       va: selectedVA,
@@ -200,11 +206,8 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
 
     // Bio breaks if any
     if (editBioMinutes > 0) {
-      const bioOutTs = `${targetDate}T12:00:00.000Z`;
-      const bioInMin = 12 * 60 + editBioMinutes;
-      const bioInHH = String(Math.floor(bioInMin / 60)).padStart(2, '0');
-      const bioInMM = String(bioInMin % 60).padStart(2, '0');
-      const bioInTs = `${targetDate}T${bioInHH}:${bioInMM}:00.000Z`;
+      const bioOutTs = wallMinutes(12 * 60);
+      const bioInTs = wallMinutes(12 * 60 + editBioMinutes);
 
       newPunches.push({
         id: `punch-edit-bio-out-${Date.now()}-2`,
@@ -226,11 +229,8 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
 
     // Emergency breaks if any
     if (editEmergencyMinutes > 0) {
-      const emOutTs = `${targetDate}T14:30:00.000Z`;
-      const emInMin = 14 * 60 + 30 + editEmergencyMinutes;
-      const emInHH = String(Math.floor(emInMin / 60)).padStart(2, '0');
-      const emInMM = String(emInMin % 60).padStart(2, '0');
-      const emInTs = `${targetDate}T${emInHH}:${emInMM}:00.000Z`;
+      const emOutTs = wallMinutes(14 * 60 + 30);
+      const emInTs = wallMinutes(14 * 60 + 30 + editEmergencyMinutes);
 
       newPunches.push({
         id: `punch-edit-em-out-${Date.now()}-4`,
@@ -251,7 +251,7 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
     }
 
     // Last Logout
-    const logoutTs = `${targetDate}T${editLastLogoutTime}:00.000Z`;
+    const logoutTs = wall(editLastLogoutTime);
     newPunches.push({
       id: `punch-edit-logout-${Date.now()}-6`,
       va: selectedVA,
@@ -290,8 +290,8 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
     const rows = payPeriod.dailySummaries.map((day) => [
       day.date,
       selectedVA,
-      day.firstLogin ? new Date(day.firstLogin).toLocaleTimeString() : 'N/A',
-      day.lastLogout ? new Date(day.lastLogout).toLocaleTimeString() : 'N/A',
+      day.firstLogin ? formatDallasTime(day.firstLogin) : 'N/A',
+      day.lastLogout ? formatDallasTime(day.lastLogout) : 'N/A',
       day.workingMinutes,
       (day.workingMinutes / 60).toFixed(2),
       day.bioBreakMinutes,
@@ -396,12 +396,12 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
         <div className="flex items-center gap-2 text-xs font-mono text-[#5E6660]">
           <Clock className="w-3.5 h-3.5 text-[#B85338]" />
           <span>
-            {currentTime.toLocaleDateString('en-US', {
+            {formatDallasDate(currentTime, {
               weekday: 'short',
               month: 'short',
               day: 'numeric',
             })}{' '}
-            • {currentTime.toLocaleTimeString()}
+            • {formatDallasTime(currentTime)} {dallasZoneAbbr(currentTime)} (Dallas)
           </span>
         </div>
       </div>
@@ -438,9 +438,9 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
               </div>
               <div className="text-[11px] text-[#5E6660]">
                 {currentStatusInfo.lastActionTime
-                  ? `Last punch: ${new Date(
+                  ? `Last punch: ${formatDallasTime(
                       currentStatusInfo.lastActionTime
-                    ).toLocaleTimeString()} (${currentStatusInfo.lastAction})`
+                    )} (${currentStatusInfo.lastAction})`
                   : 'No punches recorded today yet'}
               </div>
             </div>
@@ -569,7 +569,7 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
                 <span className="text-[#5E6660]">First Log In:</span>
                 <span className="font-mono font-bold text-[#1F2421]">
                   {todaySummary.firstLogin
-                    ? new Date(todaySummary.firstLogin).toLocaleTimeString()
+                    ? formatDallasTime(todaySummary.firstLogin)
                     : 'Not logged in yet'}
                 </span>
               </div>
@@ -592,7 +592,7 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
                 <span className="text-[#5E6660]">Latest Action:</span>
                 <span className="font-mono font-bold text-[#1F2421]">
                   {todaySummary.lastLogout
-                    ? `Logged out at ${new Date(todaySummary.lastLogout).toLocaleTimeString()}`
+                    ? `Logged out at ${formatDallasTime(todaySummary.lastLogout)}`
                     : currentStatus === 'WORKING'
                     ? 'Shift currently active'
                     : 'Off duty'}
@@ -703,9 +703,7 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
                   const val = e.target.value;
                   setRangeStart(val);
                   if (val) {
-                    const startObj = new Date(val + 'T12:00:00');
-                    startObj.setDate(startObj.getDate() + 13);
-                    setRangeEnd(startObj.toISOString().split('T')[0]);
+                    setRangeEnd(addDaysToDateKey(val, 13));
                   }
                 }}
                 className="bg-transparent font-mono text-xs font-semibold text-[#1F2421] outline-none cursor-pointer"
@@ -805,7 +803,7 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
 
                       <td className="py-2.5 px-4 font-mono text-[11px] text-[#5E6660]">
                         {day.firstLogin
-                          ? new Date(day.firstLogin).toLocaleTimeString([], {
+                          ? formatDallasTime(day.firstLogin, {
                               hour: '2-digit',
                               minute: '2-digit',
                             })
@@ -826,7 +824,7 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
 
                       <td className="py-2.5 px-4 font-mono text-[11px] text-[#5E6660]">
                         {day.lastLogout
-                          ? new Date(day.lastLogout).toLocaleTimeString([], {
+                          ? formatDallasTime(day.lastLogout, {
                               hour: '2-digit',
                               minute: '2-digit',
                             })
@@ -1147,7 +1145,7 @@ export const TimesheetView: React.FC<TimesheetViewProps> = ({
                     new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
                 )
                 .map((punch) => {
-                  const pTime = new Date(punch.timestamp).toLocaleTimeString();
+                  const pTime = formatDallasTime(punch.timestamp);
                   return (
                     <div
                       key={punch.id}
