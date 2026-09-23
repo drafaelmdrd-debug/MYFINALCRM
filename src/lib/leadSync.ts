@@ -17,6 +17,13 @@
  *    at a time. If you have an unsaved edit to the same lead, yours wins.
  *  - Array order (the dialer queue, "new leads first") is preserved with a
  *    `sort_key` number stored on each row.
+ *
+ * Edits to an EXISTING lead are sent as a small field-level patch (`crm_patch_leads`
+ * in supabase/schema.sql), and applied by the database on top of whatever the row
+ * holds right now. So two people changing different fields of the same lead — or both
+ * adding a phone number, or both adding a note — never overwrite each other. Only two
+ * people changing the very same field at the same instant is still "last one wins".
+ * (If that function isn't installed yet, the engine falls back to whole-lead saves.)
  */
 
 const TABLE = 'crm_leads';
@@ -26,6 +33,7 @@ const MIGRATED_MARKER = 'leads_migrated';
 
 const PAGE = 1000;
 const WRITE_BATCH = 200;
+const PATCH_BATCH = 50;
 const DELETE_BATCH = 200;
 const RETRY_MS = 5000;
 const REMOTE_APPLY_MS = 120;
@@ -33,6 +41,7 @@ const REMOTE_APPLY_MS = 120;
 /** The small slice of the Supabase client this engine needs. */
 export interface SyncClient {
   from: (table: string) => any;
+  rpc?: (fn: string, args: object) => any;
   channel: (name: string) => any;
   removeChannel: (channel: any) => any;
 }
@@ -102,6 +111,124 @@ export function assignKeys<T extends { id: string }>(arr: T[], keys: Map<string,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Field-level patches (used for saving edits and for merging other people's edits)
+// ---------------------------------------------------------------------------
+
+export interface ArrayOps {
+  added: unknown[];
+  removed: string[];
+  changed: unknown[];
+}
+
+export interface LeadPatch {
+  /** top-level fields to overwrite */
+  set: Record<string, unknown>;
+  /** top-level fields to delete */
+  remove: string[];
+  /** text appended to a text field (call notes) instead of replacing it */
+  append: Record<string, string>;
+  /** lists of records with an `id` (phone numbers, contacts): add / remove / change by id */
+  arrays: Record<string, ArrayOps>;
+}
+
+/** Text fields that only ever grow (timestamped notes) — merged by appending. */
+const APPEND_FIELDS = new Set(['callNotes', 'vaNotes', 'notes']);
+/** Lists of `{ id, … }` records — merged item by item. */
+const ID_ARRAY_FIELDS = new Set(['phoneNumbers', 'contacts']);
+
+type Rec = Record<string, unknown>;
+const cj = (v: unknown): string => (v === undefined ? '\u0000undefined' : JSON.stringify(sortDeep(v)));
+const isRec = (v: unknown): v is Rec => !!v && typeof v === 'object' && !Array.isArray(v);
+const idOf = (x: unknown): string | null => (isRec(x) && typeof x.id === 'string' ? x.id : null);
+const allHaveUniqueIds = (a: unknown[]): boolean =>
+  a.every((x) => idOf(x) !== null) && new Set(a.map(idOf)).size === a.length;
+
+/** What did `local` change compared with `base`? */
+export function diffLead(base: object, local: object): LeadPatch {
+  const b0 = base as Rec;
+  const l0 = local as Rec;
+  const patch: LeadPatch = { set: {}, remove: [], append: {}, arrays: {} };
+  const keys = new Set([...Object.keys(b0), ...Object.keys(l0)]);
+  for (const k of keys) {
+    const b = b0[k];
+    const l = l0[k];
+    if (cj(b) === cj(l)) continue;
+    if (l === undefined) {
+      patch.remove.push(k);
+      continue;
+    }
+    if (
+      APPEND_FIELDS.has(k) &&
+      typeof l === 'string' &&
+      (b === undefined || typeof b === 'string') &&
+      l.length > ((b as string | undefined) ?? '').length &&
+      l.startsWith((b as string | undefined) ?? '')
+    ) {
+      patch.append[k] = l.slice(((b as string | undefined) ?? '').length);
+      continue;
+    }
+    if (ID_ARRAY_FIELDS.has(k) && Array.isArray(l) && (b === undefined || Array.isArray(b))) {
+      const ba = ((b as unknown[] | undefined) ?? []) as unknown[];
+      if (allHaveUniqueIds(ba) && allHaveUniqueIds(l)) {
+        const baseById = new Map(ba.map((x) => [idOf(x) as string, x]));
+        const localIds = new Set(l.map((x) => idOf(x) as string));
+        const added = l.filter((x) => !baseById.has(idOf(x) as string));
+        const removed = ba.map((x) => idOf(x) as string).filter((id) => !localIds.has(id));
+        const changed = l.filter(
+          (x) => baseById.has(idOf(x) as string) && cj(baseById.get(idOf(x) as string)) !== cj(x)
+        );
+        if (added.length || removed.length || changed.length) {
+          patch.arrays[k] = { added, removed, changed };
+          continue;
+        }
+        // only the order changed: fall through and send the whole list
+      }
+    }
+    patch.set[k] = l;
+  }
+  return patch;
+}
+
+/** Apply a patch on top of `target` (the same steps `crm_patch_leads` runs in the database). */
+export function applyPatch<T extends object>(target: T, patch: LeadPatch): T {
+  const out: Rec = { ...(target as Rec) };
+  for (const k of patch.remove) delete out[k];
+  Object.assign(out, patch.set);
+  for (const [k, suffix] of Object.entries(patch.append)) {
+    const cur = typeof out[k] === 'string' ? (out[k] as string) : '';
+    if (!cur.endsWith(suffix)) out[k] = cur + suffix; // already there = a retry of the same write
+  }
+  for (const [k, op] of Object.entries(patch.arrays)) {
+    let arr: unknown[] = Array.isArray(out[k]) ? [...(out[k] as unknown[])] : [];
+    const removed = new Set(op.removed);
+    arr = arr.filter((x) => {
+      const id = idOf(x);
+      return id === null || !removed.has(id);
+    });
+    const changed = new Map(op.changed.map((x) => [idOf(x) as string, x]));
+    arr = arr.map((x) => {
+      const id = idOf(x);
+      return id !== null && changed.has(id) ? changed.get(id) : x;
+    });
+    const have = new Set(arr.map(idOf).filter((id): id is string => id !== null));
+    for (const a of op.added) {
+      const id = idOf(a);
+      if (id === null || !have.has(id)) arr.push(a);
+    }
+    out[k] = arr;
+  }
+  return out as T;
+}
+
+/** Combine my edits (base → local) with what the database now holds (remote). */
+export function mergeLead<T extends object>(base: T, local: T, remote: T): T {
+  return applyPatch(remote, diffLead(base, local));
+}
+
+const isMissingFunction = (e: { code?: string; message?: string } | null | undefined): boolean =>
+  !!e && (e.code === 'PGRST202' || e.code === '42883' || /could not find the function|does not exist/i.test(e.message ?? ''));
+
 export class LeadSyncEngine<T extends { id: string }> {
   private readonly client: SyncClient;
   private readonly initialValue: T[];
@@ -130,6 +257,7 @@ export class LeadSyncEngine<T extends { id: string }> {
   private flushCounter = 0;
   private channel: unknown = null;
   private subscribedBefore = false;
+  private patchSupported = true;
 
   constructor(opts: EngineOptions<T>) {
     this.client = opts.client;
@@ -380,8 +508,9 @@ export class LeadSyncEngine<T extends { id: string }> {
       if (this.loaded) void this.reconcile(this.epoch); // partial payload: re-read instead of guessing
       return;
     }
-    // Echo of our own write: our local copy is already the newer truth.
-    if (row.writer && row.writer.startsWith(`${this.clientId}:`)) return;
+    // Our own writes come back here too. That's fine: applyRemote() ignores anything that
+    // isn't newer than what we already have, and merges it in if the database combined our
+    // edit with someone else's.
     this.enqueueRemote({ kind: 'upsert', row });
   }
 
@@ -435,7 +564,20 @@ export class LeadSyncEngine<T extends { id: string }> {
       const local = byId.get(id);
       const dirty = local ? !s || this.canon(local) !== s.json : false;
       this.synced.set(id, { json, key: sort_key, version });
-      if (dirty) continue; // our unsaved edit wins; it goes out on the next save
+      if (dirty) {
+        // We have unsent edits to this lead: keep them AND take in what the other person
+        // changed. What's left different from the database goes out on the next save.
+        if (s && local) {
+          const merged = mergeLead(JSON.parse(s.json) as T, local, value);
+          byId.set(id, merged);
+          if (this.keys.get(id) === s.key && s.key !== sort_key) {
+            this.keys.set(id, sort_key);
+            needSort = true;
+          }
+          changed = true;
+        }
+        continue;
+      }
       if (!byId.has(id) || this.keys.get(id) !== sort_key) needSort = true;
       this.keys.set(id, sort_key);
       byId.set(id, value);
@@ -506,27 +648,78 @@ export class LeadSyncEngine<T extends { id: string }> {
     }, RETRY_MS);
   }
 
+  /**
+   * The database applied our patches on top of the latest row, which may include other
+   * people's changes. Take that result in, keeping any edits we made after sending.
+   */
+  private adoptServerRows(
+    rows: { lead_id: string; lead_value: T; lead_sort_key: number; lead_version: number }[],
+    sentJson: Map<string, string>
+  ) {
+    const localById = new Map<string, T>();
+    for (const l of this.items) if (!localById.has(l.id)) localById.set(l.id, l);
+    const updates = new Map<string, T>();
+
+    for (const r of rows) {
+      const s = this.synced.get(r.lead_id);
+      if (s && s.version >= r.lead_version) continue; // a newer copy is already merged in
+      this.synced.set(r.lead_id, {
+        json: this.canon(r.lead_value),
+        key: r.lead_sort_key,
+        version: r.lead_version,
+      });
+      const local = localById.get(r.lead_id);
+      if (!local) continue; // deleted here in the meantime — the delete goes out on the next save
+      this.keys.set(r.lead_id, r.lead_sort_key);
+      const sent = sentJson.get(r.lead_id);
+      const localJson = this.canon(local);
+      let next: T;
+      if (sent === undefined) next = local;
+      else if (localJson === sent) next = r.lead_value; // no edits since sending: just take the merged row
+      else next = mergeLead(JSON.parse(sent) as T, local, r.lead_value); // edited again meanwhile
+      if (this.canon(next) !== localJson) updates.set(r.lead_id, next);
+    }
+
+    if (updates.size > 0) {
+      this.items = this.items.map((l) => updates.get(l.id) ?? l);
+      this.publish();
+    }
+    this.again = true; // anything still different from the database goes out again (usually nothing)
+  }
+
   private async flushOnce(epoch: number): Promise<boolean> {
     const current = this.items;
     assignKeys(current, this.keys);
     const writer = `${this.clientId}:${++this.flushCounter}`;
 
     const seen = new Set<string>();
+    // New leads (or everything, if the patch function isn't installed): whole-row upsert.
     const upserts: { row: { id: string; value: T; sort_key: number; writer: string }; json: string; key: number }[] = [];
+    // Existing leads that changed: field-level patch.
+    const patches: { lead: T; json: string; key: number; keyChanged: boolean; patch: LeadPatch }[] = [];
     for (const lead of current) {
       if (seen.has(lead.id)) continue;
       seen.add(lead.id);
       const json = this.canon(lead);
       const key = this.keys.get(lead.id) as number;
       const s = this.synced.get(lead.id);
-      if (!s || s.json !== json || s.key !== key) {
+      if (s && s.json === json && s.key === key) continue;
+      if (s && this.patchSupported && this.client.rpc) {
+        patches.push({
+          lead,
+          json,
+          key,
+          keyChanged: s.key !== key,
+          patch: diffLead(JSON.parse(s.json), lead),
+        });
+      } else {
         upserts.push({ row: { id: lead.id, value: lead, sort_key: key, writer }, json, key });
       }
     }
     const deletes: string[] = [];
     for (const id of this.synced.keys()) if (!seen.has(id)) deletes.push(id);
 
-    if (upserts.length === 0 && deletes.length === 0) return true;
+    if (upserts.length === 0 && patches.length === 0 && deletes.length === 0) return true;
 
     for (let i = 0; i < upserts.length; i += WRITE_BATCH) {
       const batch = upserts.slice(i, i + WRITE_BATCH);
@@ -550,6 +743,40 @@ export class LeadSyncEngine<T extends { id: string }> {
           this.synced.set(b.row.id, { json: b.json, key: b.key, version });
         }
       }
+    }
+
+    // Sorted by id so two people saving many leads at once always lock rows in the same order.
+    patches.sort((a, b) => (a.lead.id < b.lead.id ? -1 : a.lead.id > b.lead.id ? 1 : 0));
+    for (let i = 0; i < patches.length; i += PATCH_BATCH) {
+      const batch = patches.slice(i, i + PATCH_BATCH);
+      const { data, error } = await (this.client.rpc as NonNullable<SyncClient['rpc']>)('crm_patch_leads', {
+        items: batch.map((b) => ({
+          id: b.lead.id,
+          patch: b.patch,
+          full: b.lead, // only used if the lead was deleted by someone else meanwhile
+          sort_key: b.keyChanged ? b.key : null,
+          writer,
+        })),
+      });
+      if (epoch !== this.epoch) return true;
+      if (error) {
+        if (isMissingFunction(error)) {
+          // The database hasn't been given the latest supabase/schema.sql yet.
+          console.warn(
+            '[leadSync] crm_patch_leads is not installed — saving whole leads instead. ' +
+              'Run the latest supabase/schema.sql to stop simultaneous edits overwriting each other.'
+          );
+          this.patchSupported = false;
+          this.again = true;
+          return true;
+        }
+        this.onError('save', (error.message as string) ?? 'Save failed');
+        return false;
+      }
+      this.adoptServerRows(
+        (data ?? []) as { lead_id: string; lead_value: T; lead_sort_key: number; lead_version: number }[],
+        new Map(batch.map((b) => [b.lead.id, b.json]))
+      );
     }
 
     for (let i = 0; i < deletes.length; i += DELETE_BATCH) {
