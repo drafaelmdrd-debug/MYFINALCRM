@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Lead,
   CRMTask,
@@ -43,10 +43,13 @@ import { NewLeadModal } from './components/NewLeadModal';
 import { ExportModal } from './components/ExportModal';
 import { defaultGroupsForView } from './logic/exportLeads';
 import { subscribeDialerSync } from './utils/dialerSyncChannel';
-import { CheckCircle2, AlertTriangle, X } from 'lucide-react';
+import { CheckCircle2 } from 'lucide-react';
 import { useAuth } from './lib/AuthContext';
 import { LoginScreen } from './components/LoginScreen';
-import { useCloudState } from './lib/cloudSync';
+import { useCloudState, CLOUD_SYNC_ERROR_EVENT, CLOUD_SYNC_OK_EVENT } from './lib/cloudSync';
+import { useCloudLeads } from './lib/cloudLeads';
+import { supabase } from './lib/supabase';
+import { dallasDateKey, formatDallasTime } from './utils/dallasTime';
 
 const DEFAULT_CAMPAIGNS = [
   'Dallas Tax Delinquent',
@@ -65,43 +68,43 @@ export default function App() {
   const { session, loading: authLoading, signOut } = useAuth();
   const signedIn = !!session;
 
-  // Master Leads State — shared across every signed-in user via Supabase
-  const [leads, setLeads, leadsLoaded, leadsSyncError] = useCloudState<Lead[]>(
-    'leads',
-    INITIAL_LEADS,
-    signedIn
-  );
+  // Master Leads State — shared across every signed-in user via Supabase.
+  // Each lead is its own database row, so two people editing different leads
+  // never overwrite each other.
+  const [leads, setLeads, leadsLoaded] = useCloudLeads<Lead>(INITIAL_LEADS, signedIn);
 
   // Campaigns State — shared
-  const [campaigns, setCampaigns, , campaignsSyncError] = useCloudState<string[]>(
+  const [campaigns, setCampaigns] = useCloudState<string[]>(
     'campaigns',
     DEFAULT_CAMPAIGNS,
     signedIn
   );
 
-  // Helper to preserve task completion status across re-evaluations
-  const mergeDailyTasks = (freshTasks: CRMTask[], prevTasks: CRMTask[]): CRMTask[] => {
-    const prevMap = new Map(prevTasks.map((t) => [t.id, t]));
-    return freshTasks.map((t) => {
-      const existing = prevMap.get(t.id);
-      if (existing) {
-        return {
-          ...t,
-          completed: existing.completed,
-          completedAt: existing.completedAt,
-        };
-      }
-      return t;
-    });
-  };
-
-  // Daily Tasks State
-  const [tasks, setTasks] = useState<CRMTask[]>(() => {
-    return generateDailyTasks(INITIAL_LEADS);
-  });
+  // Daily Tasks — DERIVED from the leads (single source of truth), so any edit
+  // to a lead shows up in Tasks instantly, and any edit made in Tasks is
+  // written straight onto the lead. Only "which tasks are ticked done" is
+  // stored separately (shared + persisted), keyed by task + due date.
+  const [taskDone, setTaskDone] = useCloudState<Record<string, string>>('task_done', {}, signedIn);
+  const taskDoneKey = (t: CRMTask) => `${t.id}@${t.nextTaskDate}`;
+  // "Today" is always the Dallas, Texas calendar day, and it rolls over at Dallas midnight
+  // even if the page has been left open overnight.
+  const [todayKey, setTodayKey] = useState<string>(() => dallasDateKey());
+  useEffect(() => {
+    const t = setInterval(() => setTodayKey(dallasDateKey()), 30_000);
+    return () => clearInterval(t);
+  }, []);
+  const tasks = useMemo<CRMTask[]>(
+    () =>
+      generateDailyTasks(leads).map((t) => {
+        const at = taskDone[taskDoneKey(t)];
+        return at ? { ...t, completed: true, completedAt: at } : t;
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [leads, taskDone, todayKey]
+  );
 
   // KPI Call Results Counts State — shared
-  const [callResults, setCallResults] = useCloudState<CallResultCount>(
+  const [callResults, setCallResults, callResultsLoaded] = useCloudState<CallResultCount>(
     'call_results',
     INITIAL_CALL_RESULTS,
     signedIn
@@ -121,6 +124,32 @@ export default function App() {
     signedIn
   );
 
+  // Surface database save/load failures instead of failing silently
+  // Tracked per data key, so a successful save of one thing can't hide a failure of another.
+  const [syncErrors, setSyncErrors] = useState<Record<string, string>>({});
+  const syncError = Object.values(syncErrors)[0] ?? null;
+  useEffect(() => {
+    const onErr = (e: Event) => {
+      const d = (e as CustomEvent).detail as { key: string; action: string; message: string };
+      setSyncErrors((prev) => ({ ...prev, [d.key]: `Could not ${d.action} "${d.key}": ${d.message}` }));
+    };
+    const onOk = (e: Event) => {
+      const key = ((e as CustomEvent).detail as { key?: string } | undefined)?.key;
+      if (!key) return;
+      setSyncErrors((prev) => {
+        if (!(key in prev)) return prev;
+        const { [key]: _removed, ...rest } = prev;
+        return rest;
+      });
+    };
+    window.addEventListener(CLOUD_SYNC_ERROR_EVENT, onErr);
+    window.addEventListener(CLOUD_SYNC_OK_EVENT, onOk);
+    return () => {
+      window.removeEventListener(CLOUD_SYNC_ERROR_EVENT, onErr);
+      window.removeEventListener(CLOUD_SYNC_OK_EVENT, onOk);
+    };
+  }, []);
+
   // UI Navigation & Modals State
   const [currentView, setCurrentView] = useState<MainNavView>('power-dialer');
   const [globalSearch, setGlobalSearch] = useState<string>('');
@@ -133,43 +162,46 @@ export default function App() {
   const [isExportOpen, setIsExportOpen] = useState<boolean>(false);
   const [toast, setToast] = useState<{ message: string; sub?: string } | null>(null);
 
-  // Surfaces cloud sync failures (e.g. a bulk import that updated the
-  // screen but failed to persist to Supabase). Unlike `toast`, this does
-  // NOT auto-dismiss — losing data silently is exactly the bug this is
-  // here to prevent, so it stays up until the user closes it or the sync
-  // actually succeeds.
-  const syncError = leadsSyncError || campaignsSyncError;
-  const [dismissedSyncError, setDismissedSyncError] = useState<string | null>(null);
-
-  // Once leads have loaded from the shared workspace, recompile today's task
-  // board from them (the initial `tasks` state above was built from the
-  // local placeholder data before the real leads arrived).
+  // Daily Call Dispositions Matrix Refresh — shared and decided by the database.
+  // The first signed-in browser to see a new DALLAS calendar day "claims" it through
+  // `claim_call_results_day` (see supabase/schema.sql); only that one browser resets
+  // the counts. Everyone else — including people opening the app later in the day,
+  // or on another device — gets `false` and leaves the counts alone.
+  const lastClaimCheckedDay = useRef<string | null>(null);
   useEffect(() => {
-    if (leadsLoaded) {
-      setTasks((prev) => mergeDailyTasks(generateDailyTasks(leads), prev));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [leadsLoaded]);
+    if (!signedIn || !callResultsLoaded) return;
+    let cancelled = false;
 
-  // Daily Call Dispositions Matrix Refresh:
-  // "Call Dispositions Matrix refreshes everyday"
-  // This still uses localStorage for the *date marker* only — it's a
-  // per-browser "have I already refreshed today" flag, not shared data.
-  useEffect(() => {
-    if (!signedIn) return;
-    const today = new Date().toISOString().split('T')[0];
-    const lastDate = localStorage.getItem('groundwork_crm_call_results_date');
-    if (lastDate && lastDate !== today) {
-      const refreshed: CallResultCount = {};
-      Object.keys(callResults).forEach((k) => {
-        refreshed[k] = { Rain: 0, Jah: 0, Jen: 0, David: 0, total: 0 };
-      });
-      setCallResults(refreshed);
-      showToast('Call Results Dispositions matrix refreshed for today’s session.', 'Daily Refresh');
-    }
-    localStorage.setItem('groundwork_crm_call_results_date', today);
+    const checkNewDay = async () => {
+      const today = dallasDateKey();
+      if (lastClaimCheckedDay.current === today) return;
+      const { data, error } = await supabase.rpc('claim_call_results_day', { today });
+      if (cancelled) return;
+      if (error) {
+        console.error('[daily reset] could not check the day:', error.message);
+        return; // try again on the next tick
+      }
+      lastClaimCheckedDay.current = today;
+      if (data === true) {
+        setCallResults((prev) => {
+          const refreshed: CallResultCount = {};
+          Object.keys(prev).forEach((k) => {
+            refreshed[k] = { Rain: 0, Jah: 0, Jen: 0, David: 0, total: 0 };
+          });
+          return refreshed;
+        });
+        showToast('Call Results Dispositions matrix refreshed for today’s session.', 'Daily Refresh');
+      }
+    };
+
+    checkNewDay();
+    const t = setInterval(checkNewDay, 60_000); // also catches a tab left open past Dallas midnight
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [signedIn]);
+  }, [signedIn, callResultsLoaded]);
 
   const showToast = (message: string, sub?: string) => {
     setToast({ message, sub });
@@ -180,9 +212,7 @@ export default function App() {
 
   // Recompile daily tasks when leads change or manually requested
   const handleRefreshTasks = () => {
-    const compiled = generateDailyTasks(leads);
-    setTasks(compiled);
-    showToast('Task board recompiled successfully.', 'Tasks Updated');
+    showToast('Task board is live — it always reflects the latest lead data.', 'Tasks Updated');
   };
 
   // Re-run full KPI count matching countExistingKPIs()
@@ -263,7 +293,7 @@ export default function App() {
     setFollowupTaskCalls(zeroCounts);
 
     // Reset daily tasks to uncompleted so the team starts fresh from 0
-    setTasks((prev) => prev.map((t) => ({ ...t, completed: false, completedAt: undefined })));
+    setTaskDone({});
 
     showToast(
       'Daily Refresh: Follow-Up Task Calls reset to 0. Every daily task completed will add +1.',
@@ -289,9 +319,9 @@ export default function App() {
     };
     setPunches((prev) => [...prev, newPunch]);
     showToast(
-      `${punch.va}: ${punch.action.replace('_', ' ')} recorded at ${new Date(
+      `${punch.va}: ${punch.action.replace('_', ' ')} recorded at ${formatDallasTime(
         punch.timestamp
-      ).toLocaleTimeString()}`,
+      )} (Dallas time)`,
       'Timesheet Punch Logged'
     );
   };
@@ -314,7 +344,6 @@ export default function App() {
   const handleBulkImportLeads = (newLeads: Lead[]) => {
     const updated = [...newLeads, ...leads];
     setLeads(updated);
-    setTasks((prev) => mergeDailyTasks(generateDailyTasks(updated), prev));
     showToast(
       `Successfully imported ${newLeads.length} leads into the CRM.`,
       'Bulk Ingestion Complete'
@@ -331,13 +360,6 @@ export default function App() {
     if (selectedLead?.id === updated.id) {
       setSelectedLead(updated);
     }
-
-    // Refresh task queue if date or stage changed
-    setTimeout(() => {
-      setTasks((prev) =>
-        mergeDailyTasks(generateDailyTasks(leads.map((l) => (l.id === updated.id ? updated : l))), prev)
-      );
-    }, 100);
 
     // If lead was moved to Deal Pipeline, DNC, or Language Barrier, advance active dialer lead
     if (activeDialerLeadId === lead.id && isLeadInDealPipeline(updated)) {
@@ -361,9 +383,6 @@ export default function App() {
   const handleUpdateLead = (updatedLead: Lead) => {
     setLeads((prev) => prev.map((l) => (l.id === updatedLead.id ? updatedLead : l)));
     setSelectedLead(updatedLead);
-    setTasks((prev) =>
-      mergeDailyTasks(generateDailyTasks(leads.map((l) => (l.id === updatedLead.id ? updatedLead : l))), prev)
-    );
     showToast(`Saved changes for ${updatedLead.ownerName}`);
   };
 
@@ -373,7 +392,6 @@ export default function App() {
     const leadName = targetLead ? targetLead.ownerName : 'Lead';
 
     setLeads((prev) => prev.filter((l) => l.id !== leadId));
-    setTasks((prev) => prev.filter((t) => t.leadId !== leadId));
 
     // If currently open in drawer, close it
     if (selectedLead?.id === leadId) {
@@ -660,7 +678,6 @@ export default function App() {
     });
 
     // 7. Update Daily Tasks
-    setTasks((prev) => mergeDailyTasks(generateDailyTasks(newLeads), prev));
 
     showToast(
       `Saved ${agent} | ${phoneNumber} | ${disposition}`,
@@ -670,10 +687,6 @@ export default function App() {
 
   // Two-Way Back Sync for Task Edits (Matches syncTaskEditBackToSource_)
   const handleUpdateTask = (task: CRMTask, updatedFields: Partial<CRMTask>) => {
-    // 1. Update task in task list
-    const updatedTask = { ...task, ...updatedFields };
-    setTasks((prev) => prev.map((t) => (t.id === task.id ? updatedTask : t)));
-
     // 2. Locate source lead and back-sync
     const sourceLead = leads.find((l) => l.id === task.leadId);
     if (!sourceLead) return;
@@ -692,8 +705,9 @@ export default function App() {
     // VA assignment back-sync (updates lead.taskAssignedTo so it survives daily refreshes)
     if (updatedFields.taskAssignedTo) {
       leadUpdates.taskAssignedTo = updatedFields.taskAssignedTo;
-    } else if (updatedFields.assignedVA) {
-      leadUpdates.taskAssignedTo = updatedFields.assignedVA;
+    }
+    if (updatedFields.assignedVA) {
+      leadUpdates.assignedVA = updatedFields.assignedVA;
     }
 
     // Inline note change back-sync
@@ -729,6 +743,19 @@ export default function App() {
     );
   };
 
+  // Direct edit from the Tasks board: writes straight onto the original lead.
+  const handleEditLeadFromTask = (leadId: string, patch: Partial<Lead>) => {
+    setLeads((prev) => prev.map((l) => (l.id === leadId ? { ...l, ...patch } : l)));
+    if (selectedLead?.id === leadId) {
+      setSelectedLead({ ...selectedLead, ...patch });
+    }
+  };
+
+  const handleTaskStatusChange = (leadId: string, newStatus: string) => {
+    const lead = leads.find((l) => l.id === leadId);
+    if (lead) handleStatusChange(lead, newStatus);
+  };
+
   const handleCompleteTask = (taskId: string) => {
     const target = tasks.find((t) => t.id === taskId);
     if (!target) return;
@@ -736,18 +763,15 @@ export default function App() {
     const newCompleted = !target.completed;
     const attributedVA = getTaskAttributedVA(target);
 
-    const updatedTasks = tasks.map((t) => {
-      if (t.id === taskId) {
-        return {
-          ...t,
-          completed: newCompleted,
-          completedAt: newCompleted ? new Date().toISOString().split('T')[0] : undefined,
-        };
+    setTaskDone((prev) => {
+      const next = { ...prev };
+      if (newCompleted) {
+        next[taskDoneKey(target)] = dallasDateKey();
+      } else {
+        delete next[taskDoneKey(target)];
       }
-      return t;
+      return next;
     });
-
-    setTasks(updatedTasks);
 
     setFollowupTaskCalls((prev) => {
       const currentVal = prev[attributedVA] || 0;
@@ -828,7 +852,6 @@ export default function App() {
   const handleAddNewLead = (newLead: Lead) => {
     const updated = [newLead, ...leads];
     setLeads(updated);
-    setTasks((prev) => mergeDailyTasks(generateDailyTasks(updated), prev));
     showToast(`Added ${newLead.ownerName} to ${newLead.campaign}`);
   };
 
@@ -875,32 +898,22 @@ export default function App() {
   // so nobody briefly sees the empty/placeholder state on first load.
   if (!leadsLoaded) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-[#F8F6F1] text-sm text-[#5E6660]">
-        Loading shared workspace…
+      <div className="min-h-screen flex flex-col items-center justify-center gap-3 bg-[#F8F6F1] text-sm text-[#5E6660] px-6 text-center">
+        {syncError ? (
+          <div className="max-w-xl bg-red-600 text-white text-xs font-semibold px-4 py-3 rounded-lg">
+            ⚠ Could not load the shared workspace. Most likely the database setup hasn't been run
+            yet — run <code>supabase/schema.sql</code> in the Supabase SQL editor, then refresh.
+            <div className="mt-1 font-normal opacity-90">{syncError}</div>
+          </div>
+        ) : (
+          'Loading shared workspace…'
+        )}
       </div>
     );
   }
 
   return (
     <div className="min-h-screen flex flex-col bg-[#F8F6F1] text-[#1F2421] selection:bg-[#B85338]/20 selection:text-[#B85338]">
-      {/* Cloud Sync Error Banner — stays up until dismissed or the sync recovers */}
-      {syncError && syncError !== dismissedSyncError && (
-        <div className="fixed top-16 right-6 z-50 bg-red-50 text-red-900 px-4 py-3 rounded-lg shadow-2xl border border-red-200 flex items-start gap-3 animate-in fade-in slide-in-from-top-2 duration-200 max-w-md">
-          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
-          <div className="text-xs space-y-0.5 flex-1">
-            <div className="font-bold">Sync problem</div>
-            <div className="text-red-800 text-[11px]">{syncError}</div>
-          </div>
-          <button
-            onClick={() => setDismissedSyncError(syncError)}
-            className="text-red-400 hover:text-red-700 shrink-0"
-            aria-label="Dismiss"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-      )}
-
       {/* Toast Notification Banner */}
       {toast && (
         <div className="fixed top-16 right-6 z-50 bg-[#1F2421] text-white px-4 py-3 rounded-lg shadow-2xl border border-[#E4E0D6]/20 flex items-start gap-3 animate-in fade-in slide-in-from-top-2 duration-200 max-w-md">
@@ -911,6 +924,12 @@ export default function App() {
             <div className="font-bold">{toast.message}</div>
             {toast.sub && <div className="text-[#A4AEA7] text-[11px]">{toast.sub}</div>}
           </div>
+        </div>
+      )}
+
+      {syncError && (
+        <div className="fixed top-0 inset-x-0 z-[100] bg-red-600 text-white text-xs font-semibold px-4 py-2 text-center">
+          ⚠ Changes are NOT being saved to the database. {syncError}
         </div>
       )}
 
@@ -965,6 +984,9 @@ export default function App() {
               tasks={tasks}
               onRefreshTasks={handleRefreshTasks}
               onUpdateTask={handleUpdateTask}
+              onEditLead={handleEditLeadFromTask}
+              onChangeStatus={handleTaskStatusChange}
+              leads={leads}
               onCompleteTask={handleCompleteTask}
               onOpenLeadDetail={handleOpenLeadDetail}
               onLaunchDialer={handleLaunchDialer}
