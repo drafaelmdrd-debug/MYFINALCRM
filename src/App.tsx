@@ -43,6 +43,7 @@ import { NewLeadModal } from './components/NewLeadModal';
 import { ExportModal } from './components/ExportModal';
 import { defaultGroupsForView } from './logic/exportLeads';
 import { subscribeDialerSync } from './utils/dialerSyncChannel';
+import { addNewPhones, PhoneAdd } from './logic/duplicates';
 import { CheckCircle2 } from 'lucide-react';
 import { useAuth } from './lib/AuthContext';
 import { LoginScreen } from './components/LoginScreen';
@@ -341,13 +342,26 @@ export default function App() {
   };
 
   // Bulk Import Handler
-  const handleBulkImportLeads = (newLeads: Lead[]) => {
-    const updated = [...newLeads, ...leads];
-    setLeads(updated);
-    showToast(
-      `Successfully imported ${newLeads.length} leads into the CRM.`,
-      'Bulk Ingestion Complete'
-    );
+  // `phoneAdds` = numbers found in the file for addresses that are already in the CRM.
+  // They're added to the existing lead (never duplicated); no second lead is created.
+  const handleBulkImportLeads = (newLeads: Lead[], phoneAdds: PhoneAdd[] = []) => {
+    const addsById = new Map(phoneAdds.map((a) => [a.leadId, a.phones]));
+    setLeads((prev) => {
+      const patched = addsById.size
+        ? prev.map((l) => {
+            const adds = addsById.get(l.id);
+            if (!adds) return l;
+            return addNewPhones(l, adds);
+          })
+        : prev;
+      return [...newLeads, ...patched];
+    });
+    const parts = [`${newLeads.length} new lead${newLeads.length === 1 ? '' : 's'}`];
+    if (phoneAdds.length > 0) {
+      const n = phoneAdds.reduce((sum, a) => sum + a.phones.length, 0);
+      parts.push(`${n} new number${n === 1 ? '' : 's'} added to ${phoneAdds.length} existing lead${phoneAdds.length === 1 ? '' : 's'}`);
+    }
+    showToast(`Imported ${parts.join(' + ')}.`, 'Bulk Ingestion Complete');
   };
 
   // Move Engine Status Change Handler
@@ -1116,6 +1130,7 @@ export default function App() {
         campaigns={campaigns}
         onAddNewCampaign={handleAddNewCampaign}
         onImportLeads={handleBulkImportLeads}
+        existingLeads={leads}
         defaultDestination={bulkImportDestination}
       />
 
