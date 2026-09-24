@@ -7,11 +7,50 @@ const TABLE = 'crm_state';
 export const CLOUD_SYNC_ERROR_EVENT = 'cloudsync:error';
 export const CLOUD_SYNC_OK_EVENT = 'cloudsync:ok';
 
+const isAuthExpiryMessage = (message: string): boolean =>
+  /jwt expired|invalid jwt|jwt is expired|token is expired/i.test(message);
+
+// De-dupe so a burst of failed requests (e.g. a whole batch of leads) only
+// triggers one refresh instead of one per failure.
+let refreshInFlight: Promise<void> | null = null;
+
+/**
+ * The access token expired before Supabase's own background refresh got to it —
+ * most commonly because the tab was asleep/backgrounded for a while. Every save
+ * that failed with "JWT expired" is already on an automatic retry timer (see
+ * `saveLatest` below and `LeadSyncEngine.scheduleRetry`), but a retry just resends
+ * the same request with the same stale token, so without this it fails the exact
+ * same way forever. Refreshing here means the next automatic retry succeeds
+ * instead of nagging the user with a permanent "not saved" state.
+ */
+function refreshExpiredSession() {
+  if (refreshInFlight) return;
+  refreshInFlight = supabase.auth
+    .refreshSession()
+    .then(({ error }) => {
+      if (error) {
+        // Refresh token itself is no good anymore (e.g. truly signed out elsewhere,
+        // or the browser wiped storage) — Supabase will emit a SIGNED_OUT auth event,
+        // AuthContext picks that up, and the app drops back to the login screen.
+        console.error('[cloudSync] Session refresh after JWT expiry failed:', error.message);
+      }
+    })
+    .catch((e) => {
+      console.error('[cloudSync] Session refresh after JWT expiry failed:', e instanceof Error ? e.message : e);
+    })
+    .finally(() => {
+      refreshInFlight = null;
+    });
+}
+
 export function reportError(key: string, action: 'load' | 'save', message: string) {
   console.error(`[cloudSync] Failed to ${action} "${key}": ${message}`);
   window.dispatchEvent(
     new CustomEvent(CLOUD_SYNC_ERROR_EVENT, { detail: { key, action, message } })
   );
+  if (isAuthExpiryMessage(message)) {
+    refreshExpiredSession();
+  }
 }
 
 export function reportOk(key: string) {
