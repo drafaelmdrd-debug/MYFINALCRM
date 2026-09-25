@@ -868,13 +868,25 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
         newLeads: parsedLeads,
         phoneAdds: [],
         matches: [],
-        stats: { rows: parsedLeads.length, newLeads: parsedLeads.length, matchedExisting: 0, mergedInFile: 0, numbersAdded: 0, numbersSkipped: 0 },
+        pipelineSkips: [],
+        stats: {
+          rows: parsedLeads.length,
+          newLeads: parsedLeads.length,
+          matchedExisting: 0,
+          mergedInFile: 0,
+          numbersAdded: 0,
+          numbersSkipped: 0,
+          pipelineSkipped: 0,
+        },
       };
     }
     return planImport(parsedLeads, existingLeads || []);
   }, [parsedLeads, existingLeads, dedupeEnabled]);
   const hasDuplicateActivity =
-    plan.stats.matchedExisting > 0 || plan.stats.mergedInFile > 0 || plan.stats.numbersSkipped > 0;
+    plan.stats.matchedExisting > 0 ||
+    plan.stats.mergedInFile > 0 ||
+    plan.stats.numbersSkipped > 0 ||
+    plan.stats.pipelineSkipped > 0;
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1433,7 +1445,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
                 <FileSearch className="w-4 h-4 text-[#B85338]" />
                 <span className="text-xs font-bold text-[#1F2421]">Duplicate Check</span>
                 <span className="text-[11px] text-[#5E6660]">
-                  Same address = same lead. Numbers already on it are ignored; only new numbers are added.
+                  Same address = same lead. If it's already in Deal Pipeline/DNC/Language Barrier/Needs Skiptracing, the row is skipped. If it's still on the Power Dialer, only new numbers are added — no duplicate address.
                 </span>
               </div>
               <label className="flex items-center gap-1.5 text-[11px] font-semibold text-[#1F2421] cursor-pointer shrink-0">
@@ -1470,7 +1482,38 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
                     <strong className="text-amber-700">{plan.stats.numbersSkipped}</strong> duplicate number
                     {plan.stats.numbersSkipped === 1 ? '' : 's'} ignored
                   </span>
+                  {plan.stats.pipelineSkipped > 0 && (
+                    <span>
+                      <strong className="text-red-700">{plan.stats.pipelineSkipped}</strong> address
+                      {plan.stats.pipelineSkipped === 1 ? '' : 'es'} skipped (already in Deal Pipeline)
+                    </span>
+                  )}
                 </div>
+                {plan.pipelineSkips.length > 0 && (
+                  <div className="space-y-1">
+                    <div className="text-[11px] font-bold text-red-700">
+                      Skipped — already in Deal Pipeline / DNC / Language Barrier / Needs Skiptracing:
+                    </div>
+                    <div className="max-h-32 overflow-y-auto space-y-1">
+                      {plan.pipelineSkips.slice(0, 50).map((s) => (
+                        <div
+                          key={s.leadId}
+                          className="flex items-start justify-between gap-3 p-1.5 rounded bg-red-50 border border-red-200"
+                        >
+                          <div className="min-w-0">
+                            <div className="font-bold text-[#1F2421] truncate">
+                              {s.address}{' '}
+                              <span className="font-normal text-[#5E6660]">· {s.ownerName} · {s.stage}</span>
+                            </div>
+                          </div>
+                          <div className="shrink-0 text-[11px] font-mono text-right text-red-700">
+                            skipped
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 {plan.matches.length > 0 && (
                   <div className="max-h-32 overflow-y-auto space-y-1">
                     {plan.matches.slice(0, 50).map((m) => (
