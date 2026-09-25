@@ -1,4 +1,5 @@
 import { Lead, PhoneNumberRecord } from '../types';
+import { isLeadInDealPipeline } from './moveEngine';
 
 /**
  * Duplicate detection for imports.
@@ -8,8 +9,12 @@ import { Lead, PhoneNumberRecord } from '../types';
  *    city don't contradict each other.
  *  - Two phone numbers are the same when their digits match (country code 1, spaces,
  *    dashes and brackets are ignored).
- *  - A row that matches a lead already in the CRM is NOT imported as a new lead. Only the
- *    phone numbers that lead doesn't have yet are added to it.
+ *  - A row that matches a lead already in the CRM is NOT imported as a new lead.
+ *      - If that existing lead is already in the Deal Pipeline (Project Mgmt, Follow-Up,
+ *        DNC, Language Barrier, Needs Skiptracing/Deepdive, Needs Deepdive), the row is
+ *        skipped entirely — nothing is added or changed on it. It's already being worked.
+ *      - Otherwise (it's still a cold Power Dialer lead) only the phone numbers that lead
+ *        doesn't have yet are added to it. No second lead / address record is created.
  *  - A row that matches an earlier row in the same file is merged into it the same way.
  */
 
@@ -103,23 +108,36 @@ export interface ImportMatch {
   skipped: string[];
 }
 
+/** An address that matched a lead already sitting in the Deal Pipeline — the whole row was skipped. */
+export interface PipelineSkip {
+  leadId: string;
+  ownerName: string;
+  address: string;
+  stage: string;
+  reason: string;
+}
+
 export interface ImportPlan {
   /** Rows that are genuinely new leads. */
   newLeads: Lead[];
-  /** Numbers to add to leads already in the CRM. */
+  /** Numbers to add to leads already in the CRM (Power Dialer / cold leads only). */
   phoneAdds: PhoneAdd[];
-  /** One entry per existing lead that the file touched (for the on-screen summary). */
+  /** One entry per existing (non-pipeline) lead that the file touched (for the on-screen summary). */
   matches: ImportMatch[];
+  /** Addresses that were skipped outright because that lead is already in Deal Pipeline / DNC / Language Barrier / Needs Skiptracing. */
+  pipelineSkips: PipelineSkip[];
   stats: {
     rows: number;
     newLeads: number;
-    /** rows that matched a lead already in the CRM */
+    /** rows that matched a lead already in the CRM (Power Dialer, numbers merged) */
     matchedExisting: number;
     /** rows merged into an earlier row of the same file */
     mergedInFile: number;
     numbersAdded: number;
     /** numbers ignored because that lead / row already had them */
     numbersSkipped: number;
+    /** rows skipped entirely because the address already matched a Deal Pipeline / DNC / Language Barrier / Needs Skiptracing lead */
+    pipelineSkipped: number;
   };
 }
 
@@ -136,11 +154,20 @@ export function planImport(parsed: Lead[], existing: Lead[]): ImportPlan {
   const knownPhones = new Map<string, Set<string>>(); // existing lead id -> digits already on it
   const addsByLead = new Map<string, PhoneNumberRecord[]>();
   const matchByLead = new Map<string, ImportMatch>();
+  const pipelineSkipByLead = new Map<string, PipelineSkip>();
 
   const out: Lead[] = [];
   const outByStreet = new Map<string, number[]>(); // street key -> positions in `out`
 
-  const stats = { rows: parsed.length, newLeads: 0, matchedExisting: 0, mergedInFile: 0, numbersAdded: 0, numbersSkipped: 0 };
+  const stats = {
+    rows: parsed.length,
+    newLeads: 0,
+    matchedExisting: 0,
+    mergedInFile: 0,
+    numbersAdded: 0,
+    numbersSkipped: 0,
+    pipelineSkipped: 0,
+  };
 
   for (const row of parsed) {
     // 1. Same number listed twice on one row → keep it once.
@@ -168,6 +195,25 @@ export function planImport(parsed: Lead[], existing: Lead[]): ImportPlan {
     // 2. Already in the CRM?
     const hit = (byStreet.get(key) || []).find((e) => sameArea(e, lead));
     if (hit) {
+      // 2a. That address is already being worked in the Deal Pipeline (Project Mgmt,
+      //     Follow-Up, DNC, Language Barrier, Needs Skiptracing/Deepdive). Skip the row
+      //     entirely — don't touch that lead and don't create a new one for it.
+      if (isLeadInDealPipeline(hit)) {
+        if (!pipelineSkipByLead.has(hit.id)) {
+          pipelineSkipByLead.set(hit.id, {
+            leadId: hit.id,
+            ownerName: hit.ownerName,
+            address: hit.propertyAddress,
+            stage: hit.stageId,
+            reason: `Already in Deal Pipeline (${hit.stageId}) — import skipped for this address`,
+          });
+        }
+        stats.pipelineSkipped++;
+        continue;
+      }
+
+      // 2b. Still a Power Dialer / cold lead: same address, no new lead — just add any
+      //     numbers it doesn't already have.
       let have = knownPhones.get(hit.id);
       if (!have) {
         have = phonesOf(hit);
@@ -230,7 +276,13 @@ export function planImport(parsed: Lead[], existing: Lead[]): ImportPlan {
 
   stats.newLeads = out.length;
   const phoneAdds: PhoneAdd[] = Array.from(addsByLead.entries()).map(([leadId, phones]) => ({ leadId, phones }));
-  return { newLeads: out, phoneAdds, matches: Array.from(matchByLead.values()), stats };
+  return {
+    newLeads: out,
+    phoneAdds,
+    matches: Array.from(matchByLead.values()),
+    pipelineSkips: Array.from(pipelineSkipByLead.values()),
+    stats,
+  };
 }
 
 /** Add `phones` to a lead, skipping any number it already has. Returns the same object if nothing is new. */
