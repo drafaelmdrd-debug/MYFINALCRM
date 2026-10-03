@@ -94,6 +94,7 @@ export type StandardField =
   | 'maxOffer'
   | 'counterOffer'
   | 'status'
+  | 'taskDate'
   | 'owner1Name'
   | 'owner1Phone1'
   | 'owner1Phone2'
@@ -119,6 +120,47 @@ const normStatusText = (s: string): string =>
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
+
+/**
+ * Turn a spreadsheet date ("2026-10-05", "10/5/2026", "10/5/26", "Oct 5, 2026", Excel serial)
+ * into YYYY-MM-DD. Returns '' when it can't be read as a date.
+ */
+export const parseImportDate = (raw: string): string => {
+  const v = (raw || '').trim();
+  if (!v) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const build = (y: number, m: number, d: number): string => {
+    if (y < 100) y += 2000;
+    if (m < 1 || m > 12 || d < 1 || d > 31) return '';
+    const dt = new Date(y, m - 1, d);
+    if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) return '';
+    return `${y}-${pad(m)}-${pad(d)}`;
+  };
+
+  // YYYY-MM-DD or YYYY/MM/DD (optionally followed by a time)
+  let m = v.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
+  if (m) return build(+m[1], +m[2], +m[3]);
+
+  // M/D/YYYY, M-D-YYYY, M/D/YY (US order, optionally followed by a time)
+  m = v.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})(?!\d)/);
+  if (m) return build(+m[3], +m[1], +m[2]);
+
+  // Excel serial date number
+  if (/^\d{5}$/.test(v)) {
+    const serial = parseInt(v, 10);
+    if (serial > 20000 && serial < 80000) {
+      const dt = new Date(Math.round((serial - 25569) * 86400 * 1000));
+      return `${dt.getUTCFullYear()}-${pad(dt.getUTCMonth() + 1)}-${pad(dt.getUTCDate())}`;
+    }
+  }
+
+  // "Oct 5, 2026", "October 5 2026", "5 Oct 2026"
+  const parsed = new Date(v);
+  if (!isNaN(parsed.getTime()) && /[a-z]{3}/i.test(v)) {
+    return build(parsed.getFullYear(), parsed.getMonth() + 1, parsed.getDate());
+  }
+  return '';
+};
 
 /**
  * Turn whatever text is in a spreadsheet's Status/Stage column ("interested had asking price",
@@ -438,6 +480,15 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
         return;
       }
 
+      // Task / Callback Due Date (must precede Notes, whose keywords include "call")
+      if (
+        (lower.includes('due') || lower.includes('callback') || lower.includes('call back') || lower.includes('task') || lower.includes('follow')) &&
+        lower.includes('date')
+      ) {
+        mappings[idx] = 'taskDate';
+        return;
+      }
+
       // Notes & Call Logs
       if (
         lower.includes('note') ||
@@ -584,6 +635,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
       let maxOffer = '';
       let counterOffer = '';
       let rowStatusRaw = '';
+      let rowTaskDateRaw = '';
 
       // Owner-specific maps
       const ownerNames: Record<number, string> = {};
@@ -653,6 +705,9 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
             break;
           case 'status':
             if (cleanVal && !rowStatusRaw) rowStatusRaw = cleanVal;
+            break;
+          case 'taskDate':
+            if (cleanVal && !rowTaskDateRaw) rowTaskDateRaw = cleanVal;
             break;
 
           // Owner 1
@@ -851,7 +906,14 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
 
       if (destination === 'deal_pipeline') {
         const routed = routeLead(initialLead, rowStatus);
-        leads.push(routed.updatedLead);
+        const routedLead = routed.updatedLead;
+        // Task / Callback Due Date from the file overrides the auto-calculated date
+        const taskDate = parseImportDate(rowTaskDateRaw);
+        if (taskDate) {
+          if (routedLead.stageId === 'Follow-Up') routedLead.followUpDate = taskDate;
+          else if (routedLead.stageId === 'Project Mgmt') routedLead.callbackDate = taskDate;
+        }
+        leads.push(routedLead);
       } else {
         leads.push(initialLead);
       }
@@ -1349,6 +1411,7 @@ export const BulkImportModal: React.FC<BulkImportModalProps> = ({
                           <option value="maxOffer">Max Offer</option>
                           <option value="counterOffer">Counter Offer</option>
                           <option value="status">Status / Stage (Interested, Has Asking Price…)</option>
+                          <option value="taskDate">Task / Callback Due Date</option>
                         </optgroup>
                         <optgroup label="Multi-Owner: Owner 1">
                           <option value="owner1Name">Owner 1 Name</option>
