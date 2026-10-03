@@ -86,6 +86,9 @@ export default function App() {
   // written straight onto the lead. Only "which tasks are ticked done" is
   // stored separately (shared + persisted), keyed by task + due date.
   const [taskDone, setTaskDone] = useCloudState<Record<string, string>>('task_done', {}, signedIn);
+  // Who got the +1 for each ticked task, so un-ticking removes it from that same person
+  // even if the task's "completed by" name was changed afterwards.
+  const [taskCredit, setTaskCredit] = useCloudState<Record<string, string>>('task_credit', {}, signedIn);
   const taskDoneKey = (t: CRMTask) => `${t.id}@${t.nextTaskDate}`;
   // "Today" is always the Dallas, Texas calendar day, and it rolls over at Dallas midnight
   // even if the page has been left open overnight.
@@ -295,6 +298,7 @@ export default function App() {
 
     // Reset daily tasks to uncompleted so the team starts fresh from 0
     setTaskDone({});
+    setTaskCredit({});
 
     showToast(
       'Daily Refresh: Follow-Up Task Calls reset to 0. Every daily task completed will add +1.',
@@ -770,20 +774,91 @@ export default function App() {
     if (lead) handleStatusChange(lead, newStatus);
   };
 
-  const handleCompleteTask = (taskId: string) => {
+  // Edits made on a Daily Tasks row. They are held in the board and only written onto the
+  // original lead when the agent ticks Done.
+  type TaskEdits = Partial<
+    Pick<CRMTask, 'taskAssignedTo' | 'assignedVA' | 'nextTaskDate' | 'status' | 'taskNotes'>
+  >;
+
+  const handleCompleteTask = (taskId: string, edits?: TaskEdits) => {
     const target = tasks.find((t) => t.id === taskId);
     if (!target) return;
 
     const newCompleted = !target.completed;
-    const attributedVA = getTaskAttributedVA(target);
+    const hasEdits = newCompleted && !!edits && Object.keys(edits).length > 0;
+
+    // Credit goes to whoever was ORIGINALLY on "Task should be completed by" when the task
+    // is ticked Done, even if the agent changes that name in the same edit. Un-ticking
+    // removes the +1 from the person who actually received it.
+    const originalVA = getTaskAttributedVA(target);
+    const attributedVA = newCompleted
+      ? originalVA
+      : ((taskCredit[taskDoneKey(target)] as VA | undefined) ?? originalVA);
+
+    // Done marker is keyed by task + due date; if the due date changes we mark the new key too.
+    const doneKeys: string[] = [taskDoneKey(target)];
+
+    if (hasEdits && edits) {
+      const sourceLead = leads.find((l) => l.id === target.leadId);
+      if (sourceLead) {
+        let lead: Lead = { ...sourceLead };
+
+        // 1. Assignees first, so status routing sees the chosen owner.
+        if (edits.assignedVA) lead.assignedVA = edits.assignedVA;
+        if (edits.taskAssignedTo) lead.taskAssignedTo = edits.taskAssignedTo;
+
+        // 2. Status (auto-routes stage & dates, same as the lead drawer).
+        const statusChanged = !!edits.status;
+        if (edits.status) {
+          lead = routeLead(lead, edits.status, lead.assignedVA).updatedLead;
+          if (edits.assignedVA) lead.assignedVA = edits.assignedVA;
+          if (edits.taskAssignedTo) lead.taskAssignedTo = edits.taskAssignedTo;
+        }
+
+        // 3. A date the agent typed wins over the auto-calculated one.
+        if (edits.nextTaskDate) {
+          if (!statusChanged) {
+            if (target.sourceTabName === 'Project Mgmt') lead.callbackDate = edits.nextTaskDate;
+            else lead.followUpDate = edits.nextTaskDate;
+          } else if (lead.stageId === 'Project Mgmt') {
+            lead.callbackDate = edits.nextTaskDate;
+          } else if (lead.stageId === 'Follow-Up') {
+            lead.followUpDate = edits.nextTaskDate;
+          }
+        }
+
+        // 4. Note (date-stamped, appended to the lead's note trail).
+        if (edits.taskNotes) {
+          lead.callNotes = appendTimestampedNote(lead.callNotes || '', edits.taskNotes);
+          lead.vaNotes = lead.callNotes;
+        }
+
+        const finalLead = lead;
+        setLeads((prev) => prev.map((l) => (l.id === finalLead.id ? finalLead : l)));
+        if (selectedLead?.id === finalLead.id) setSelectedLead(finalLead);
+
+        // If the task is still on the board after the edits (e.g. due date still today or
+        // earlier), keep it showing as Done under its new due date as well.
+        const after = generateDailyTasks([finalLead])[0];
+        if (after) doneKeys.push(taskDoneKey(after));
+      }
+    }
 
     setTaskDone((prev) => {
       const next = { ...prev };
-      if (newCompleted) {
-        next[taskDoneKey(target)] = dallasDateKey();
-      } else {
-        delete next[taskDoneKey(target)];
-      }
+      doneKeys.forEach((k) => {
+        if (newCompleted) next[k] = dallasDateKey();
+        else delete next[k];
+      });
+      return next;
+    });
+
+    setTaskCredit((prev) => {
+      const next = { ...prev };
+      doneKeys.forEach((k) => {
+        if (newCompleted) next[k] = attributedVA;
+        else delete next[k];
+      });
       return next;
     });
 
@@ -795,7 +870,9 @@ export default function App() {
 
     showToast(
       newCompleted
-        ? `Task completed! +1 added to ${attributedVA} under Follow-Up Task Calls Made (${target.taskType})`
+        ? hasEdits
+          ? `Task completed & edits saved to the lead! +1 added to ${attributedVA} under Follow-Up Task Calls Made (${target.taskType})`
+          : `Task completed! +1 added to ${attributedVA} under Follow-Up Task Calls Made (${target.taskType})`
         : `Task marked incomplete (-1 for ${attributedVA}).`,
       'Daily Outreach Synchronized'
     );
@@ -1042,6 +1119,7 @@ export default function App() {
               onLaunchDialer={handleLaunchDialer}
               onOpenImport={() => setIsBulkImportOpen(true)}
               onDeleteLead={handleDeleteLead}
+              onEditLead={handleEditLeadFromTask}
             />
           )}
 
