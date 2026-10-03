@@ -16,10 +16,14 @@ import {
   User,
   MapPin,
   ExternalLink,
-  Plus,
 } from 'lucide-react';
 import { VABadge } from './VABadge';
 import { DialLink } from './DialLink';
+
+/** Edits an agent made on a task row that are NOT saved to the lead until Done is ticked. */
+export type TaskEdits = Partial<
+  Pick<CRMTask, 'taskAssignedTo' | 'assignedVA' | 'nextTaskDate' | 'status' | 'taskNotes'>
+>;
 
 interface TasksTableViewProps {
   tasks: CRMTask[];
@@ -30,10 +34,12 @@ interface TasksTableViewProps {
   onUpdateTask: (task: CRMTask, updatedFields: Partial<CRMTask>) => void;
   onEditLead?: (leadId: string, patch: Partial<Lead>) => void;
   onChangeStatus?: (leadId: string, newStatus: string) => void;
-  onCompleteTask: (taskId: string) => void;
+  /** Ticking Done saves every pending edit (VA, date, note, status) onto the original lead in one go. */
+  onCompleteTask: (taskId: string, edits?: TaskEdits) => void;
   onOpenLeadDetail: (lead: Lead) => void;
   onLaunchDialer: (leadId: string, phoneNumber?: string, openedWithDial?: boolean) => void;
 }
+
 
 const STATUS_GROUPS: { label: string; options: { value: string; text: string }[] }[] = [
   {
@@ -83,8 +89,6 @@ export function TasksTableView({
   tasks,
   leads,
   onRefreshTasks,
-  onUpdateTask,
-  onChangeStatus,
   onCompleteTask,
   onOpenLeadDetail,
   onLaunchDialer,
@@ -93,17 +97,46 @@ export function TasksTableView({
   const [typeFilter, setTypeFilter] = useState<string>('all');
   const [tabFilter, setTabFilter] = useState<string>('all');
   const [searchFilter, setSearchFilter] = useState<string>('');
-  // Text typed into a task's "add note" box but not yet saved onto its lead.
+  // Text typed into a task's "add note" box. Saved onto the lead only when Done is ticked.
   const [noteDrafts, setNoteDrafts] = useState<Record<string, string>>({});
+  // Other pending edits (VA, due date, status) per task. Nothing here touches the
+  // original lead until the agent ticks Done.
+  const [drafts, setDrafts] = useState<Record<string, TaskEdits>>({});
 
-  const commitNote = (task: CRMTask) => {
-    const text = (noteDrafts[task.id] || '').trim();
-    if (!text) return;
-    setNoteDrafts((prev) => {
-      const { [task.id]: _done, ...rest } = prev;
+  const setDraft = (task: CRMTask, patch: TaskEdits) => {
+    setDrafts((prev) => ({ ...prev, [task.id]: { ...(prev[task.id] || {}), ...patch } }));
+  };
+
+  // Only the fields that actually differ from the lead's current data.
+  const buildEdits = (task: CRMTask): TaskEdits => {
+    const d = drafts[task.id] || {};
+    const edits: TaskEdits = {};
+    if (d.taskAssignedTo && d.taskAssignedTo !== (task.taskAssignedTo || task.assignedVA)) {
+      edits.taskAssignedTo = d.taskAssignedTo;
+    }
+    if (d.assignedVA && d.assignedVA !== task.assignedVA) edits.assignedVA = d.assignedVA;
+    if (d.nextTaskDate && d.nextTaskDate !== task.nextTaskDate) edits.nextTaskDate = d.nextTaskDate;
+    if (d.status && d.status !== task.status) edits.status = d.status;
+    const note = (noteDrafts[task.id] || '').trim();
+    if (note) edits.taskNotes = note;
+    return edits;
+  };
+
+  const handleDone = (task: CRMTask) => {
+    if (task.completed) {
+      onCompleteTask(task.id); // un-tick: nothing to save
+      return;
+    }
+    const edits = buildEdits(task);
+    onCompleteTask(task.id, edits);
+    setDrafts((prev) => {
+      const { [task.id]: _d, ...rest } = prev;
       return rest;
     });
-    onUpdateTask(task, { taskNotes: text }); // appended (date-stamped) onto the source lead
+    setNoteDrafts((prev) => {
+      const { [task.id]: _n, ...rest } = prev;
+      return rest;
+    });
   };
 
   // Newest entry of the lead's note trail (entries are separated by a blank line).
@@ -111,6 +144,9 @@ export function TasksTableView({
     const parts = (notes || '').split(/\n\s*\n/).map((x) => x.trim()).filter(Boolean);
     return parts.length ? parts[parts.length - 1] : '';
   };
+
+  const shownCompletedBy = (t: CRMTask): VA =>
+    (drafts[t.id]?.taskAssignedTo || t.taskAssignedTo || t.assignedVA || 'Rain') as VA;
 
   const filteredTasks = tasks.filter((t) => {
     const completedBy = t.taskAssignedTo || t.assignedVA || 'Rain';
@@ -255,7 +291,7 @@ export function TasksTableView({
                     <td className="py-3.5 px-4 text-center">
                       <button
                         type="button"
-                        onClick={() => onCompleteTask(task.id)}
+                        onClick={() => handleDone(task)}
                         className="cursor-pointer text-[#4A7A5E] hover:text-[#3E654E]"
                       >
                         {task.completed ? (
@@ -264,26 +300,35 @@ export function TasksTableView({
                           <Square className="w-5 h-5 text-stone-400" />
                         )}
                       </button>
+                      {!task.completed && Object.keys(buildEdits(task)).length > 0 && (
+                        <span
+                          className="block mt-1 text-[9px] font-bold leading-tight text-amber-700"
+                          title="These edits are saved to the lead when you tick Done"
+                        >
+                          Unsaved
+                        </span>
+                      )}
                     </td>
 
                     {/* Task should be completed by: */}
                     <td className="py-3.5 px-4">
                       <select
-                        value={task.taskAssignedTo || task.assignedVA || 'Rain'}
+                        value={shownCompletedBy(task)}
                         onChange={(e) => {
                           const newVA = e.target.value as VA;
-                          onUpdateTask(task, { taskAssignedTo: newVA });
+                          setDraft(task, { taskAssignedTo: newVA });
                         }}
                         className={`border rounded px-2.5 py-1 text-xs font-bold outline-none cursor-pointer ${
-                          (task.taskAssignedTo || task.assignedVA) === 'David'
+                          shownCompletedBy(task) === 'David'
                             ? 'bg-purple-50 text-purple-900 border-purple-200'
-                            : (task.taskAssignedTo || task.assignedVA) === 'Jah'
+                            : shownCompletedBy(task) === 'Jah'
                             ? 'bg-amber-50 text-amber-900 border-amber-200'
-                            : (task.taskAssignedTo || task.assignedVA) === 'Jen'
+                            : shownCompletedBy(task) === 'Jen'
                             ? 'bg-pink-50 text-pink-900 border-pink-200'
                             : 'bg-blue-50 text-blue-900 border-blue-200'
                         }`}
-                        title="Task should be completed by: (David, Jah, Jen, Rain)"
+                        disabled={!!task.completed}
+                        title="Task should be completed by: (David, Jah, Jen, Rain) - saved when you tick Done"
                       >
                         <option value="David">David</option>
                         <option value="Jah">Jah</option>
@@ -331,34 +376,21 @@ export function TasksTableView({
                           onChange={(e) =>
                             setNoteDrafts((prev) => ({ ...prev, [task.id]: e.target.value }))
                           }
-                          onBlur={() => commitNote(task)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') commitNote(task);
-                          }}
-                          placeholder="Add note (saves to lead)…"
+                          disabled={!!task.completed}
+                          placeholder="Add note (saved to lead when Done)…"
                           className="flex-1 min-w-0 text-[11px] bg-[#F8F6F1] border border-[#E4E0D6] rounded px-2 py-1 outline-none focus:border-[#B85338]"
                         />
-                        <button
-                          type="button"
-                          onMouseDown={(e) => e.preventDefault()}
-                          onClick={() => commitNote(task)}
-                          className="p-1 rounded bg-[#4A7A5E] hover:bg-[#3E654E] text-white cursor-pointer"
-                          title="Save note onto the lead"
-                        >
-                          <Plus className="w-3 h-3" />
-                        </button>
                       </div>
                     </td>
 
                     {/* Assigned VA */}
                     <td className="py-3.5 px-4">
                       <select
-                        value={task.assignedVA}
-                        onChange={(e) =>
-                          onUpdateTask(task, { assignedVA: e.target.value as VA })
-                        }
+                        value={drafts[task.id]?.assignedVA ?? task.assignedVA}
+                        onChange={(e) => setDraft(task, { assignedVA: e.target.value as VA })}
+                        disabled={!!task.completed}
                         className="bg-[#F8F6F1] hover:bg-white border border-[#E4E0D6] rounded px-2 py-1 text-xs font-bold text-[#1F2421] outline-none cursor-pointer"
-                        title="Reassign Task to VA (Syncs to Lead)"
+                        title="Reassign Task to VA (saved to the lead when you tick Done)"
                       >
                         <option value="Rain">Rain</option>
                         <option value="Jah">Jah</option>
@@ -373,12 +405,13 @@ export function TasksTableView({
                         <Calendar className="w-3.5 h-3.5 text-[#5E6660] shrink-0" />
                         <input
                           type="date"
-                          value={task.nextTaskDate || ''}
+                          value={drafts[task.id]?.nextTaskDate ?? (task.nextTaskDate || '')}
                           onChange={(e) => {
-                            if (e.target.value) onUpdateTask(task, { nextTaskDate: e.target.value });
+                            if (e.target.value) setDraft(task, { nextTaskDate: e.target.value });
                           }}
+                          disabled={!!task.completed}
                           className="bg-[#F8F6F1] border border-[#E4E0D6] rounded px-1.5 py-1 text-[11px] font-mono text-[#1F2421] outline-none cursor-pointer"
-                          title={`Saved to the ${task.sourceTabName} lead's ${
+                          title={`Saved on Done to the ${task.sourceTabName} lead's ${
                             task.sourceTabName === 'Project Mgmt' ? 'callback' : 'follow-up'
                           } date`}
                         />
@@ -411,13 +444,11 @@ export function TasksTableView({
                     {/* Status / Source */}
                     <td className="py-3.5 px-4">
                       <select
-                        value={task.status || ''}
-                        onChange={(e) => {
-                          if (onChangeStatus) onChangeStatus(task.leadId, e.target.value);
-                          else onUpdateTask(task, { status: e.target.value });
-                        }}
+                        value={drafts[task.id]?.status ?? (task.status || '')}
+                        onChange={(e) => setDraft(task, { status: e.target.value })}
+                        disabled={!!task.completed}
                         className="max-w-[170px] bg-[#F8F6F1] hover:bg-white border border-[#E4E0D6] rounded px-2 py-1 text-[11px] font-semibold text-[#1F2421] outline-none cursor-pointer"
-                        title="Changes the lead's status (auto-routes stage & dates, same as the lead drawer)"
+                        title="Changes the lead's status when you tick Done (auto-routes stage & dates, same as the lead drawer)"
                       >
                         {task.status && !ALL_STATUS_VALUES.includes(task.status) && (
                           <option value={task.status}>{task.status}</option>

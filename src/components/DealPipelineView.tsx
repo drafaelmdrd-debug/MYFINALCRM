@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   Kanban,
   MapPin,
@@ -21,6 +21,8 @@ import {
   Upload,
   Mail,
   Trash2,
+  Search,
+  X,
 } from 'lucide-react';
 import { Lead, StageId, VA } from '../types';
 import { VABadge } from './VABadge';
@@ -38,6 +40,8 @@ interface DealPipelineViewProps {
   onLaunchDialer: (leadId: string, phoneNumber?: string, openedWithDial?: boolean) => void;
   onOpenImport?: () => void;
   onDeleteLead?: (leadId: string) => void;
+  /** Saves a change straight onto the lead (used by the card's "Task should be completed by"). */
+  onEditLead?: (leadId: string, patch: Partial<Lead>) => void;
 }
 
 export type PipelineOption = 'all_pipeline' | 'project_mgmt' | 'follow_up';
@@ -76,6 +80,51 @@ export const NOT_READY_STATUSES = [
   'Not Ready to Sell - 90 Days',
 ] as const;
 
+// Status list used by the Status filter (same values as the lead drawer's status dropdown).
+const FILTER_STATUS_GROUPS: { label: string; options: { value: string; text: string }[] }[] = [
+  {
+    label: 'Project Mgmt (Active Acquisitions)',
+    options: [
+      { value: 'Interested', text: 'Interested' },
+      { value: 'Interested - Has Asking Price', text: 'Interested - Has Asking Price' },
+      { value: 'For Comps', text: 'For Comps' },
+      { value: 'For Offer', text: 'For Offer' },
+      { value: 'Offer Made', text: 'Offer Made' },
+      { value: 'Negotiating', text: 'Negotiating' },
+      { value: 'Asking too High', text: 'Asking too High (+20 days)' },
+      { value: 'Callback - Tomorrow', text: 'Callback - Tomorrow' },
+      { value: 'Comps Needed', text: 'Comps Needed (+1 day)' },
+      { value: 'Appointment In person', text: 'Appointment In person' },
+      { value: 'Accepted Offer', text: 'Accepted Offer' },
+      { value: 'Contract Sent', text: 'Contract Sent' },
+      { value: 'Deal Won', text: 'Deal Won' },
+    ],
+  },
+  {
+    label: 'Follow-Up (Nurture Timers)',
+    options: [
+      { value: 'Listed', text: 'Listed on MLS (+30 days)' },
+      { value: 'Not Interested - 30 Days', text: 'Not Interested - 30 Days' },
+      { value: 'Not Interested - 60 Days', text: 'Not Interested - 60 Days' },
+      { value: 'Not Interested - 90 Days', text: 'Not Interested - 90 Days' },
+      { value: 'Not Ready to Sell - 30 Days', text: 'Not Ready to Sell - 30 Days' },
+      { value: 'Not Ready to Sell - 60 Days', text: 'Not Ready to Sell - 60 Days' },
+      { value: 'Not Ready to Sell - 90 Days', text: 'Not Ready to Sell - 90 Days' },
+    ],
+  },
+  {
+    label: 'Routing Exceptions',
+    options: [
+      { value: 'Spanish Speaker', text: 'Spanish Speaker (Language Barrier)' },
+      { value: 'Language Barrier', text: 'Language Barrier' },
+      { value: 'DNC', text: 'DNC (Do Not Call)' },
+      { value: 'Sold Already', text: 'Sold Already' },
+      { value: 'Ugly Property', text: 'Ugly Property' },
+      { value: 'Unresponsive', text: 'Unresponsive (Never moves)' },
+    ],
+  },
+];
+
 export const DealPipelineView: React.FC<DealPipelineViewProps> = ({
   leads,
   onOpenLeadDetail,
@@ -83,20 +132,17 @@ export const DealPipelineView: React.FC<DealPipelineViewProps> = ({
   onLaunchDialer,
   onOpenImport,
   onDeleteLead,
+  onEditLead,
 }) => {
   const [pipelineOption, setPipelineOption] = useState<PipelineOption>('project_mgmt');
   const [vaFilter, setVaFilter] = useState<string>('all');
+  const [statusFilter, setStatusFilter] = useState<string>('all');
+  const [searchQuery, setSearchQuery] = useState<string>('');
   const [followupGroupFilter, setFollowupGroupFilter] = useState<'all' | 'not_interested' | 'not_ready'>('all');
   const [draggedLeadId, setDraggedLeadId] = useState<string | null>(null);
   const [activeDropZone, setActiveDropZone] = useState<string | null>(null);
   // Track displayed phone index per card (allows Next # without calling)
   const [cardPhoneIndices, setCardPhoneIndices] = useState<Record<string, number>>({});
-
-  // Filter leads based on agent
-  const agentFilteredLeads = leads.filter((l) => {
-    if (vaFilter !== 'all' && l.assignedVA !== vaFilter) return false;
-    return true;
-  });
 
   // Pipeline stage groups for "All Leads & Pipeline Columns"
   const allStages = [
@@ -151,6 +197,88 @@ export const DealPipelineView: React.FC<DealPipelineViewProps> = ({
     );
   };
 
+  // Compare statuses ignoring case, spaces and dashes ("Callback - Tomorrow" == "Callback Tomorrow")
+  const statusKey = (status?: string) => (status || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  // Status filter options: the same status list as the lead drawer, plus any other status
+  // that pipeline leads currently carry (so no lead is ever un-filterable).
+  const statusFilterGroups = useMemo(() => {
+    const groups = FILTER_STATUS_GROUPS.map((g) => ({
+      label: g.label,
+      options: g.options.map((o) => ({ value: o.value, text: o.text })),
+    }));
+
+    const known = new Set<string>();
+    groups.forEach((g) => g.options.forEach((o) => known.add(statusKey(o.value))));
+
+    const extra = new Map<string, string>();
+    const addExtra = (name: string) => {
+      const k = statusKey(name);
+      if (k && !known.has(k) && !extra.has(k)) extra.set(k, name);
+    };
+    PROJECT_MGMT_STATUSES.forEach(addExtra);
+    leads.forEach((l) => {
+      if (
+        l.stageId === 'Project Mgmt' ||
+        l.stageId === 'Follow-Up' ||
+        l.stageId === 'Language Barrier' ||
+        l.stageId === 'DNC'
+      ) {
+        addExtra(getLeadStatus(l));
+      }
+    });
+
+    if (extra.size > 0) {
+      groups.push({
+        label: 'Other statuses',
+        options: Array.from(extra.values())
+          .sort((a, b) => a.localeCompare(b))
+          .map((v) => ({ value: v, text: v })),
+      });
+    }
+    return groups;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [leads]);
+
+  // Does a lead match the search box? (owner, contacts, addresses, phone numbers)
+  const leadMatchesSearch = (lead: Lead, rawQuery: string): boolean => {
+    const q = rawQuery.trim().toLowerCase();
+    if (!q) return true;
+    const qDigits = q.replace(/\D/g, '');
+
+    const textFields = [
+      lead.ownerName,
+      lead.propertyAddress,
+      lead.mailingAddress,
+      lead.mailingCity,
+      lead.city,
+      lead.zipCode,
+      lead.mailingZip,
+      lead.leadId,
+      ...(lead.contacts || []).map((c) => c.name),
+      ...(lead.phoneNumbers || []).map((p) => p.contactName),
+    ];
+    if (textFields.some((f) => (f || '').toLowerCase().includes(q))) return true;
+
+    return (lead.phoneNumbers || []).some((p) => {
+      const num = p.number || '';
+      if (num.toLowerCase().includes(q)) return true;
+      return qDigits.length >= 3 && num.replace(/\D/g, '').includes(qDigits);
+    });
+  };
+
+  // Filter leads by agent, status and search
+  const agentFilteredLeads = leads.filter((l) => {
+    if (vaFilter !== 'all' && l.assignedVA !== vaFilter) return false;
+    if (statusFilter !== 'all' && statusKey(getLeadStatus(l)) !== statusKey(statusFilter)) {
+      return false;
+    }
+    if (!leadMatchesSearch(l, searchQuery)) return false;
+    return true;
+  });
+
+  const filtersActive = vaFilter !== 'all' || statusFilter !== 'all' || searchQuery.trim() !== '';
+
   // Drag and Drop handlers
   const handleDragStart = (e: React.DragEvent, lead: Lead) => {
     e.dataTransfer.setData('text/plain', lead.id);
@@ -200,6 +328,17 @@ export const DealPipelineView: React.FC<DealPipelineViewProps> = ({
       : undefined;
     const timerDisplay = lead.followUpDate || calculatedTimer;
     const isDragging = draggedLeadId === lead.id;
+
+    // Same rule the Daily Tasks board uses: Project Mgmt leads use the callback date,
+    // Follow-Up leads use the follow-up timer date.
+    const dateField: 'callbackDate' | 'followUpDate' =
+      lead.stageId === 'Project Mgmt'
+        ? 'callbackDate'
+        : isFollowUpLead
+        ? 'followUpDate'
+        : 'callbackDate';
+    const dateValue =
+      dateField === 'callbackDate' ? lead.callbackDate || '' : lead.followUpDate || timerDisplay || '';
 
     const contactsCount = lead.contacts?.length || 1;
     const hasMultipleContacts = lead.contacts && lead.contacts.length > 1;
@@ -273,15 +412,29 @@ export const DealPipelineView: React.FC<DealPipelineViewProps> = ({
           </div>
         )}
 
-        {/* Automated Timers / Dates */}
-        {(hasCallback || timerDisplay || isFollowUpLead) && (
+        {/* Automated Timers / Dates — the date can be edited right here */}
+        {(lead.stageId === 'Project Mgmt' ||
+          lead.stageId === 'Follow-Up' ||
+          hasCallback ||
+          timerDisplay ||
+          isFollowUpLead) && (
           <div className="flex items-center gap-1.5 text-[10px] text-[#5E6660] font-mono bg-[#FDFBF7] px-2 py-0.5 rounded border border-[#E4E0D6]">
-            <Clock className="w-3 h-3 text-[#B85338]" />
-            <span className="font-semibold">
-              {hasCallback
-                ? `Callback: ${hasCallback}`
-                : `Timer: ${timerDisplay || 'Follow-Up Active'}`}
-            </span>
+            <Clock className="w-3 h-3 text-[#B85338] shrink-0" />
+            <span className="font-semibold shrink-0">{dateField === 'callbackDate' ? 'Callback:' : 'Timer:'}</span>
+            {onEditLead ? (
+              <input
+                type="date"
+                value={dateValue}
+                onChange={(e) => {
+                  if (e.target.value) onEditLead(lead.id, { [dateField]: e.target.value } as Partial<Lead>);
+                }}
+                onClick={(e) => e.stopPropagation()}
+                className="min-w-0 flex-1 bg-white border border-[#E4E0D6] rounded px-1 py-0.5 text-[10px] font-mono text-[#1F2421] outline-none cursor-pointer focus:border-[#B85338]"
+                title={`Edit the ${dateField === 'callbackDate' ? 'callback' : 'follow-up'} date (saved to the lead)`}
+              />
+            ) : (
+              <span className="font-semibold">{dateValue || 'Follow-Up Active'}</span>
+            )}
           </div>
         )}
 
@@ -399,6 +552,31 @@ export const DealPipelineView: React.FC<DealPipelineViewProps> = ({
               )}
             </div>
           </div>
+
+          {onEditLead && (
+            <div className="space-y-0.5">
+              <span className="block text-[10px] text-[#5E6660] font-semibold uppercase tracking-wider">
+                Task should be completed by:
+              </span>
+              <select
+                value={
+                  lead.taskAssignedTo && lead.taskAssignedTo !== 'Unassigned'
+                    ? lead.taskAssignedTo
+                    : lead.assignedVA && lead.assignedVA !== 'Unassigned'
+                    ? lead.assignedVA
+                    : 'Rain'
+                }
+                onChange={(e) => onEditLead(lead.id, { taskAssignedTo: e.target.value as VA })}
+                className="bg-[#F8F6F1] hover:bg-white border border-[#E4E0D6] rounded px-1.5 py-0.5 text-[10px] font-semibold text-[#1F2421] outline-none cursor-pointer w-full"
+                title="Task should be completed by"
+              >
+                <option value="Rain">Rain</option>
+                <option value="Jah">Jah</option>
+                <option value="Jen">Jen</option>
+                <option value="David">David</option>
+              </select>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -478,6 +656,66 @@ export const DealPipelineView: React.FC<DealPipelineViewProps> = ({
               <option value="David">David (Violet)</option>
             </select>
           </div>
+
+          {/* Status Filter */}
+          <div className="flex items-center gap-1.5 text-xs">
+            <span className="font-bold text-[#5E6660] text-[10px] uppercase">Status:</span>
+            <select
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              className="bg-white border border-[#E4E0D6] rounded-md px-2.5 py-1.5 text-xs font-semibold text-[#1F2421] outline-none shadow-2xs max-w-[210px]"
+            >
+              <option value="all">All Statuses</option>
+              {statusFilterGroups.map((g) => (
+                <optgroup key={g.label} label={g.label}>
+                  {g.options.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.text}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+          </div>
+
+          {/* Search Lead */}
+          <div className="relative flex items-center">
+            <Search className="w-3.5 h-3.5 text-[#8C948E] absolute left-2.5 pointer-events-none" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search lead: name, address, phone..."
+              className="bg-white border border-[#E4E0D6] focus:border-[#B85338] rounded-md pl-8 pr-7 py-1.5 text-xs text-[#1F2421] outline-none shadow-2xs w-64"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="absolute right-1.5 text-[#8C948E] hover:text-[#1F2421] cursor-pointer"
+                title="Clear search"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+
+          {filtersActive && (
+            <span className="text-[11px] font-mono text-[#5E6660]">
+              Showing {agentFilteredLeads.length} of {leads.length}
+              <button
+                type="button"
+                onClick={() => {
+                  setVaFilter('all');
+                  setStatusFilter('all');
+                  setSearchQuery('');
+                }}
+                className="ml-2 font-bold text-[#B85338] hover:underline cursor-pointer"
+              >
+                Clear
+              </button>
+            </span>
+          )}
 
           {onOpenImport && (
             <button

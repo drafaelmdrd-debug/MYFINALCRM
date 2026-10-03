@@ -52,6 +52,9 @@ export const LeadDetailDrawer: React.FC<LeadDetailDrawerProps> = ({
   if (!isOpen || !lead) return null;
 
   const [newNoteInput, setNewNoteInput] = useState('');
+  // Editing a previous note entry in the trail (index into the entries list).
+  const [editingNoteIdx, setEditingNoteIdx] = useState<number | null>(null);
+  const [editingNoteText, setEditingNoteText] = useState('');
   const [askingPrice, setAskingPrice] = useState(lead.askingPrice || '');
   const [startingOffer, setStartingOffer] = useState(lead.startingOffer || '');
   const [maxOffer, setMaxOffer] = useState(lead.maxOffer || '');
@@ -248,6 +251,33 @@ export const LeadDetailDrawer: React.FC<LeadDetailDrawerProps> = ({
     };
     onUpdateLead(updatedLead);
     setNewNoteInput('');
+  };
+
+  // The note trail is a list of entries separated by a blank line (see appendTimestampedNote).
+  const noteEntries = (lead.callNotes || lead.vaNotes || '')
+    .split(/\n\s*\n/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  const startEditNote = (idx: number) => {
+    setEditingNoteIdx(idx);
+    setEditingNoteText(noteEntries[idx] || '');
+  };
+
+  const cancelEditNote = () => {
+    setEditingNoteIdx(null);
+    setEditingNoteText('');
+  };
+
+  // Saves the edited entry back in the same spot; the other entries are left exactly as they were.
+  const saveEditedNote = () => {
+    if (editingNoteIdx === null) return;
+    const text = editingNoteText.trim();
+    if (!text) return;
+    const next = noteEntries.map((entry, i) => (i === editingNoteIdx ? text : entry));
+    const updatedNotes = next.join('\n\n');
+    onUpdateLead({ ...lead, callNotes: updatedNotes, vaNotes: updatedNotes });
+    cancelEditNote();
   };
 
   const handleSaveFinancials = () => {
@@ -1176,9 +1206,56 @@ export const LeadDetailDrawer: React.FC<LeadDetailDrawerProps> = ({
                 </div>
               </form>
 
-              {/* Existing Notes Log */}
-              <div className="p-3 bg-[#F8F6F1] rounded border border-[#E4E0D6] max-h-48 overflow-y-auto whitespace-pre-line font-mono text-[11px] text-[#1F2421] leading-relaxed">
-                {lead.callNotes || lead.vaNotes || 'No previous note entries found for this record.'}
+              {/* Existing Notes Log — click the pencil on any entry to edit it */}
+              <div className="p-3 bg-[#F8F6F1] rounded border border-[#E4E0D6] max-h-64 overflow-y-auto font-mono text-[11px] text-[#1F2421] leading-relaxed space-y-2">
+                {noteEntries.length === 0 ? (
+                  <div>No previous note entries found for this record.</div>
+                ) : (
+                  noteEntries.map((entry, idx) =>
+                    editingNoteIdx === idx ? (
+                      <div key={idx} className="space-y-1.5">
+                        <textarea
+                          autoFocus
+                          rows={Math.min(8, Math.max(2, entry.split('\n').length + 1))}
+                          value={editingNoteText}
+                          onChange={(e) => setEditingNoteText(e.target.value)}
+                          className="w-full bg-white border border-[#B85338] rounded-md p-2 text-[11px] font-mono text-[#1F2421] outline-none"
+                        />
+                        <div className="flex justify-end gap-1.5">
+                          <button
+                            type="button"
+                            onClick={cancelEditNote}
+                            className="flex items-center gap-1 px-2 py-1 rounded border border-[#E4E0D6] bg-white hover:bg-[#F2EFE8] text-[10px] font-bold text-[#5E6660] cursor-pointer"
+                          >
+                            <X className="w-3 h-3" />
+                            <span>Cancel</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={saveEditedNote}
+                            disabled={!editingNoteText.trim()}
+                            className="flex items-center gap-1 px-2 py-1 rounded bg-[#4A7A5E] hover:bg-[#3E654E] disabled:opacity-40 text-white text-[10px] font-bold cursor-pointer"
+                          >
+                            <Check className="w-3 h-3" />
+                            <span>Save</span>
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div key={idx} className="group flex items-start gap-2">
+                        <div className="flex-1 whitespace-pre-line">{entry}</div>
+                        <button
+                          type="button"
+                          onClick={() => startEditNote(idx)}
+                          className="shrink-0 p-1 rounded text-[#8C948E] hover:text-[#B85338] hover:bg-white border border-transparent hover:border-[#E4E0D6] cursor-pointer"
+                          title="Edit this note"
+                        >
+                          <Edit2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                    )
+                  )
+                )}
               </div>
             </div>
 
